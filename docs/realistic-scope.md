@@ -25,7 +25,7 @@ This repository already demonstrates that shape end to end:
 | Request loop with input-independent memory | `docs/examples/request-loop.goose`, 11 MiB peak RSS at both 2 MB and 115 MB input (guide) |
 | Bounded pools and queues that never grow | `iteration.goose`, `realtime.goose`, `docs/examples/pool-generations.goose` |
 | Verified bytecode sandbox | `docs/examples/rule-vm.goose`, rejects bad branches before execution |
-| Small static binaries | 70–75 KB for the three samples, 483 KB for the visualizer including vendored audio and PNG code |
+| Small single-file binaries (dynamically linked libc) | 70–75 KB for the three samples, 483 KB for the visualizer including vendored audio and PNG code |
 
 What is **not** demonstrated, and should not be assumed: audio playback, a concurrent network service, TLS, subprocesses, storage I/O, windowed graphics, hard realtime, or a bounded RSS when a C library allocates.
 
@@ -177,7 +177,7 @@ All commands below were run on 2026-10-26 with the pinned package. Native `./vis
 | `pixi run screenshot` | `wrote screenshots/visualizer.png (960x540)` |
 | `pixi run stack-stats` | `main: 3 data stacks, 5 regions (reserving 2 GB each)` |
 | `pixi run viz-stack-stats` | `main: 11 data stacks, 16 regions (reserving 64 MB each)` |
-| Native binary sizes | `demo` 70,224 B; `iteration` 74,448 B; `realtime` 74,704 B; `visualizer` 483,016 B |
+| Native binary sizes (ELF PIE, dynamically linked libc) | `demo` 70,224 B; `iteration` 74,448 B; `realtime` 74,704 B; `visualizer` 483,016 B |
 | Generated C sizes | `demo.c` 67,853 B; `audio-frame-loop.c` 120,102 B; `visualizer.c` 353,078 B |
 
 The guide's larger measurements were not all repeated in full. The 4-million-line request case and 20,000 connections in 2.12 s are in [the guide's sources table](heap-less-app-guide.md#9-sources-and-verification); the smaller runs above reproduce their shape and their expected output. The `request-loop` binary at 11 MiB peak RSS for both 2 MB and 115 MB inputs is from the guide and was not re-measured here.
