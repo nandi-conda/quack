@@ -257,37 +257,65 @@ This is the category where heap-less matters most directly, and where the caveat
 3. **Bound the work.** A frame with a data-dependent loop (parsing, variable-size FFT, number of voices) needs an explicit budget and a documented drop or degrade policy.
 4. **Bound the queues.** `qlimit<T>(n)` and a drain-to-newest policy on the consumer side; never an unbounded backlog between capture and render.
 
-A verified 1024-point FFT frame loop (`docs/examples/audio-frame-loop.goose`) runs in 42–44 µs p50 native, against a 21 ms audio block at 48 kHz:
+A verified 1024-point FFT frame loop (`docs/examples/audio-frame-loop.goose`) does the FFT, the magnitudes, and a display stem split in 42–44 µs p50 native, against a 21 ms audio block at 48 kHz. The frame returns a `Stems` struct (four band energies plus an onset flag); `split()` follows the loop, and `noise()` is a small LCG used to synthesize a broadband residual:
 
 ```goose
 const N = 1024; const HALF = 512; const BINS = 64;
-var re: f32[N] = [0.0; N];      // all buffers live in globals,
-var im: f32[N] = [0.0; N];      // sized once, reused every frame
+var re: f32[N] = [0.0; N];        // all buffers live in globals,
+var im: f32[N] = [0.0; N];        // sized once, reused every frame
 var window: f32[N] = [0.0; N];
 var twr: f32[HALF] = [0.0; HALF];
 var twi: f32[HALF] = [0.0; HALF];
 var mag: f32[BINS] = [0.0; BINS];
-var phase: f32 = 0.0;
+var prev_mag: f32[BINS] = [0.0; BINS];   // for flux and the tonal test
+var phase: f32 = 0.0; var tick: i64 = 0;
 
-fn frame() -> i64 {
-    for i in N {                                  // "capture" + window
+fn frame() -> Stems {
+    let env = if tick % 24 == 0 { 1.0 } else { 0.3 };   // synthetic bursts
+    for i in N {                                        // "capture" + window
         let t = phase + i * 0.031;
-        re[i] = (sin(t as f64) as f32) * 0.6 + (sin((t * 1.7) as f64) as f32) * 0.3;
+        re[i] = ((sin((t * 0.23) as f64) as f32) * 0.6      // ~55 Hz
+               + (sin((t * 1.7) as f64) as f32) * 0.3       // ~400 Hz
+               + noise() * 0.25) * env;
         re[i] *= window[i];
         im[i] = 0.0;
     }
     phase += 0.05;
-    fft();                                        // in-place, fixed scratch
-    var peak_bin = 0;
-    var peak: f32 = 0.0;
-    for b in BINS {
-        let v = sqrt(re[b] * re[b] + im[b] * im[b]);
-        mag[b] = v;
-        if v > peak { peak = v; peak_bin = b; }
-    }
-    return peak_bin;                              // renderer reads mag[] in place
+    tick++;
+    fft();                                              // in-place, fixed scratch
+    for b in BINS { mag[b] = sqrt(re[b] * re[b] + im[b] * im[b]); }
+    return split();                                     // renderer reads mag[] in place
 }
 ```
+
+**Stem split for display.** A visualizer can group the same magnitude frame into perceptual stems without a second FFT. One pass computes positive spectral flux (the standard cheap onset cue); the split uses the low bins for sub, bins that barely moved for tonal, the flux for percussion, and the remainder as residual:
+
+```goose
+var flux: f32 = 0.0;
+var total: f32 = 0.0;
+for b in BINS {
+    let d = mag[b] - prev_mag[b];
+    if d > 0.0 { flux += d; }
+    total += mag[b];
+}
+let onset = flux > flux_mean * 1.6 && flux > 0.05;
+flux_mean = flux_mean * 0.85 + flux * 0.15;      // slow adaptive floor
+
+var sub: f32 = 0.0;
+for b in 4 { sub += mag[b]; }                     // 0..~190 Hz at 48 kHz, N = 1024
+var tonal: f32 = 0.0;
+for b in 4..BINS {
+    if abs(mag[b] - prev_mag[b]) < mag[b] * 0.25 { tonal += mag[b]; }
+}
+let percussion = min(flux * 2.0, total);
+for b in BINS { prev_mag[b] = mag[b]; }
+let residual = max(total - sub - tonal - percussion, 0.0);
+return Stems { sub: sub, percussion: percussion, tonal: tonal, residual: residual, onset: onset };
+```
+
+Verified in `audio-frame-loop.goose` with a 55 Hz tone, a 400 Hz tone, and gated noise: 300 frames produce 13 onsets (the synthetic bursts are every 24 frames) and a stable split of roughly sub 59%, percussion 5%, tonal 31%, residual 3%, with the frame still at 42–44 µs p50.
+
+This is a **display** heuristic, not source separation: it uses magnitude only, with no phase, no masking, no median filtering, and no model. Real stem separation (HPSS, NMF, or a neural separator) needs phase-coherent STFT frames, per-bin masks over time, and usually an allocator or a fixed tensor arena. What transfers is the shape: fixed scratch, one pass over the bins, no allocation, and a bounded result the renderer can consume in place.
 
 **Audio and MIDI specifics.**
 
@@ -302,7 +330,7 @@ fn frame() -> i64 {
 ```
 [C audio callback] --ring buffer--> [Goose frame loop]
                                      drain -> window -> FFT -> magnitudes
-                                     -> renderer (gfx/SDL via extern)
+                                     -> stem split -> renderer (gfx/SDL via extern)
 ```
 
 - Capture and analysis are one stage if the renderer is fast enough; then the whole visualizer is a single-threaded frame loop with no queue at all. This is the simplest and lowest-jitter design.
@@ -708,7 +736,7 @@ The project's published benchmark claims (3.3× idiomatic C++, 1.16× hand-optim
 | 11 MiB peak RSS for 2 MB and 115 MB inputs | `request-loop` native binary, `ru_maxrss` |
 | 1.8 MiB RSS / 4.2 GiB VmPeak / 20k connections in 2.12 s | `minihttp` native binary, `/proc/<pid>/status`, Python loopback client |
 | 70 ns p50 / 110–120 ns p99 request parse | 200k iterations of `handle()` in-process, `clock_ns` |
-| 42–44 µs p50 FFT frame | 300 frames, `audio-frame-loop`, 5 runs |
+| 42–44 µs p50 FFT + stem split frame | 300 frames, `audio-frame-loop`, 5 runs |
 | 0.65 ms per exec, 70 KB binary | 500 executions of a hello program, from Python |
 | 2,056 accepted / 197,944 refused | `fanout` with `qlimit` 1,024 and a 200k burst |
 
