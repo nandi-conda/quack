@@ -1,4 +1,4 @@
-// visualizer.goose -- a realtime stem-aware audio visualizer.
+// visualizer.goose -- a realtime instrument-bus audio visualizer.
 //
 //   pixi run viz                 live capture, ANSI truecolor in the terminal
 //   pixi run run-viz-native      the same, as a native executable
@@ -8,25 +8,29 @@
 // Capture lives in src/capture.c (a C sidecar): miniaudio opens the default
 // device with its native channel count (or --channels N) and its callback
 // deinterleaves into one fixed SPSC ring per channel. Everything after that is
-// Goose: a Hann window and in-place FFT per channel, four instrument-bus
+// Goose: a Hann window and in-place FFT per channel, eight instrument-bus
 // lanes per channel, a waveform and a bus-tinted spectrogram per channel, all
 // drawn into a software RGB framebuffer that is either converted to ANSI
 // half-blocks for the terminal or written as a PNG. Mono is the degenerate
 // one-channel case; stereo and up to CH_MAX channels are side-by-side panels.
 //
 // Instrument buses: BASS is 30-180 Hz; DRUMS is high-band spectral flux with
-// a transient envelope and high-frequency ratio; KEYS is prominent harmonic
-// peaks in the mid/high range; OTHER is the broadband residual. These are
-// display groupings from spectral features, not true source separation.
-// Tuning knobs are the Hz edges at the top of this file, the 1.6x
-// peak-prominence test, the flux threshold/adaptive baseline in analyze(), and
-// the attack/release taus in main().
+// a transient envelope and high-frequency ratio; KEYS, STRINGS, BRASS,
+// GUITAR and VOCALS split the prominent harmonic peaks by spectral shape
+// (body, mid, presence and air energy, plus pluck flux for GUITAR and a
+// sustain factor for STRINGS); FX is the broadband residual after subtracting
+// tonal peaks and transient flux. These are display groupings from spectral
+// features, not true source separation: the five tonal buses always share the
+// same peak energy, so they overlap. Tuning knobs are the Hz edges at the top
+// of this file, the bus shape weights in analyze(), the 1.6x peak-prominence
+// test, the flux threshold/adaptive baseline, and the attack/release taus in
+// main().
 //
 // The hot loop allocates nothing:
 //   * every buffer below is a fixed-size or fixed-capacity array in main or a
 //     data-stack-scoped value passed down by slice;
 //   * the FFT runs in place on re/im, its tables are built once at startup;
-//   * per-channel samples, magnitude arrays, band levels, stem envelopes and
+//   * per-channel samples, magnitude arrays, band levels, bus envelopes and
 //     peak holds live in a `reusable` ChannelState pool preallocated to
 //     CH_MAX slots; the framebuffer is preallocated too;
 //   * the spectrogram history is a `reusable` pool with a hard HIST bound:
@@ -69,7 +73,7 @@ extern fn host_write_png(path: const u8[:], w: i32, h: i32, rgb: const u8[:]) ->
 const SR = 48000;             // capture rate, frames per second
 const WIN = 2048;             // FFT window, 42.7 ms; 23.4 Hz per bin
 const BANDS = 64;             // log-spaced spectrum/spectrogram bands
-const STEMS = 4;              // sub, drums, synth, other
+const STEMS = 8;              // bass, drums, keys, strings, brass, guitar, vocals, fx
 const HIST = 96;              // history columns kept in the reusable pool
 const MAX_W = 960;            // offscreen render bound
 const MAX_H = 540;
@@ -82,30 +86,41 @@ const CH_MAX = 8;             // must match CAP_MAX_CHANNELS in src/capture.c
 const SNAP_LEVELS = CH_MAX * BANDS;
 const SNAP_STEMS = CH_MAX * STEMS;
 
-const STEM_SUB = 0;
+const STEM_BASS = 0;
 const STEM_DRUM = 1;
-const STEM_SYNTH = 2;
-const STEM_OTHER = 3;
+const STEM_KEYS = 2;
+const STEM_STRINGS = 3;
+const STEM_BRASS = 4;
+const STEM_GUITAR = 5;
+const STEM_VOCAL = 6;
+const STEM_FX = 7;
 
-// Stem band edges, in Hz. These are the main tuning knobs: move the split
-// between sub and mid here, and the flux range decides what counts as a
-// percussive high-frequency attack.
-const SUB_HZ_LO = 30.0;
-const SUB_HZ_HI = 180.0;
-const MID_HZ_HI = 2000.0;
-const HIGH_HZ_HI = 16000.0;
+// Bus band edges, in Hz. These are the main tuning knobs. BASS owns 30-180 Hz;
+// the tonal buses split the harmonic peaks across body, mid, presence and air;
+// the flux ranges decide what counts as a drum hit (high) or a pluck (low).
+const BASS_HZ_LO = 30.0;
+const BASS_HZ_HI = 180.0;
+const BODY_HZ_HI = 800.0;
+const MID_HZ_HI = 2500.0;
+const PRES_HZ_HI = 5000.0;
+const AIR_HZ_HI = 16000.0;
 const FLUX_HZ_LO = 1500.0;
+const PLUCK_HZ_LO = 180.0;
 const TONAL_HZ_HI = 8000.0;
 
 // stem_edges indices (FFT bins, filled once by build_tables).
-const SE_SUB_LO = 0;
-const SE_SUB_HI = 1;
-const SE_MID_HI = 2;
-const SE_HIGH_HI = 3;
-const SE_FLUX_LO = 4;
-const SE_FLUX_HI = 5;
-const SE_TONAL_HI = 6;
-const SE_COUNT = 7;
+const SE_BASS_LO = 0;
+const SE_BASS_HI = 1;
+const SE_BODY_HI = 2;
+const SE_MID_HI = 3;
+const SE_PRES_HI = 4;
+const SE_AIR_HI = 5;
+const SE_FLUX_LO = 6;
+const SE_FLUX_HI = 7;
+const SE_PLUCK_LO = 8;
+const SE_PLUCK_HI = 9;
+const SE_TONAL_HI = 10;
+const SE_COUNT = 11;
 
 // 5x7 pixel font for the lane labels. Only the letters the labels use are
 // defined; everything else renders blank.
@@ -114,7 +129,7 @@ const FONT_H = 7;
 const FONT_BYTES = 128 * FONT_W;
 
 // One frame in the bounded history pool: per-channel spectra for the
-// waterfall and per-channel stem levels for the lane sparklines.
+// waterfall and per-channel bus levels for the lane sparklines.
 struct Snap {
     levels: f32[SNAP_LEVELS],
     stems: f32[SNAP_STEMS],
@@ -269,21 +284,30 @@ fn db_level(x: f32, ref: f32) -> f32 {
 }
 
 fn stem_label(s: i64, short: bool) -> const u8[:] {
-    if s == STEM_SUB { if short { return "BAS"; } return "BASS"; }
+    if s == STEM_BASS { if short { return "BAS"; } return "BASS"; }
     if s == STEM_DRUM { if short { return "DRM"; } return "DRUMS"; }
-    if s == STEM_SYNTH { if short { return "KEY"; } return "KEYS"; }
-    if short { return "OTH"; }
-    return "OTHER";
+    if s == STEM_KEYS { if short { return "KEY"; } return "KEYS"; }
+    if s == STEM_STRINGS { if short { return "STR"; } return "STRINGS"; }
+    if s == STEM_BRASS { if short { return "BRS"; } return "BRASS"; }
+    if s == STEM_GUITAR { if short { return "GTR"; } return "GUITAR"; }
+    if s == STEM_VOCAL { if short { return "VOX"; } return "VOCALS"; }
+    return "FX";
 }
 
-fn instrument_letter(s: i64) -> const u8[:] {
-    if s == STEM_SUB { return "B"; }
-    if s == STEM_DRUM { return "D"; }
-    if s == STEM_SYNTH { return "K"; }
-    return "O";
+// Two-letter codes for narrow strip cells and squeezed lane columns.
+fn stem_code(s: i64) -> const u8[:] {
+    if s == STEM_BASS { return "BA"; }
+    if s == STEM_DRUM { return "DR"; }
+    if s == STEM_KEYS { return "KE"; }
+    if s == STEM_STRINGS { return "ST"; }
+    if s == STEM_BRASS { return "BR"; }
+    if s == STEM_GUITAR { return "GT"; }
+    if s == STEM_VOCAL { return "VO"; }
+    return "FX";
 }
 
-// Lane colours: sub blue, drums amber, synth cyan/green, other violet.
+// Lane colours: bass blue, drums amber, keys mint, strings sky, brass gold,
+// guitar magenta, vocals rose, fx slate.
 fn channel_label(ch: i64, nch: i64) -> const u8[:] {
     if nch <= 1 { return ""; }
     if nch == 2 { if ch == 0 { return "L"; } return "R"; }
@@ -298,10 +322,14 @@ fn channel_label(ch: i64, nch: i64) -> const u8[:] {
 }
 
 fn stem_color(s: i64) -> u8, u8, u8 {
-    if s == STEM_SUB { return 80, 140, 255; }
+    if s == STEM_BASS { return 80, 140, 255; }
     if s == STEM_DRUM { return 255, 150, 60; }
-    if s == STEM_SYNTH { return 60, 235, 190; }
-    return 190, 110, 255;
+    if s == STEM_KEYS { return 60, 235, 190; }
+    if s == STEM_STRINGS { return 120, 220, 255; }
+    if s == STEM_BRASS { return 255, 205, 70; }
+    if s == STEM_GUITAR { return 235, 105, 255; }
+    if s == STEM_VOCAL { return 255, 105, 150; }
+    return 145, 155, 180;
 }
 
 fn set_glyph(font: u8[:], ch: u8, c0: u8, c1: u8, c2: u8, c3: u8, c4: u8) {
@@ -330,6 +358,12 @@ fn setup_font(font: u8[:]) {
     set_glyph(font, 'L', 0x7F, 0x40, 0x40, 0x40, 0x40);
     set_glyph(font, 'A', 0x7E, 0x09, 0x09, 0x09, 0x7E);
     set_glyph(font, 'K', 0x7F, 0x08, 0x14, 0x22, 0x41);
+    set_glyph(font, 'C', 0x3E, 0x41, 0x41, 0x41, 0x22);
+    set_glyph(font, 'F', 0x7F, 0x09, 0x09, 0x09, 0x01);
+    set_glyph(font, 'G', 0x3E, 0x41, 0x49, 0x49, 0x7A);
+    set_glyph(font, 'I', 0x00, 0x41, 0x7F, 0x41, 0x00);
+    set_glyph(font, 'V', 0x1F, 0x20, 0x40, 0x20, 0x1F);
+    set_glyph(font, 'X', 0x63, 0x14, 0x08, 0x14, 0x63);
     set_glyph(font, '0', 0x3E, 0x51, 0x49, 0x45, 0x3E);
     set_glyph(font, '1', 0x00, 0x42, 0x7F, 0x40, 0x00);
     set_glyph(font, '2', 0x42, 0x61, 0x51, 0x49, 0x46);
@@ -402,29 +436,42 @@ fn build_tables(window: f32[:], cos_t: f32[:], sin_t: f32[:], bitrev: i64[:],
         band_hi[b] = hi;
     }
 
-    // Stem split, in bins. Keep the edges ordered and inside the usable
-    // positive-frequency range.
-    var slo = (SUB_HZ_LO / bin_hz) as i64;
-    var shi = (SUB_HZ_HI / bin_hz) as i64;
+    // Bus split, in bins. Keep the edges ordered and inside the usable
+    // positive-frequency range. BASS ends where the tonal body begins; the
+    // body/mid/presence/air edges split the harmonic peaks; flux_lo starts the
+    // drum band above the pluck range.
+    var blo = (BASS_HZ_LO / bin_hz) as i64;
+    var bhi = (BASS_HZ_HI / bin_hz) as i64;
+    var bdy = (BODY_HZ_HI / bin_hz) as i64;
     var mhi = (MID_HZ_HI / bin_hz) as i64;
-    var hhi = (HIGH_HZ_HI / bin_hz) as i64;
+    var phi = (PRES_HZ_HI / bin_hz) as i64;
+    var ahi = (AIR_HZ_HI / bin_hz) as i64;
     var flo = (FLUX_HZ_LO / bin_hz) as i64;
+    var plo = (PLUCK_HZ_LO / bin_hz) as i64;
     var thi = (TONAL_HZ_HI / bin_hz) as i64;
-    if slo < 1 { slo = 1; }
-    if shi <= slo { shi = slo + 1; }
-    if mhi <= shi { mhi = shi + 1; }
-    if hhi <= mhi { hhi = mhi + 1; }
-    if hhi > n / 2 { hhi = n / 2; }
-    if flo <= shi { flo = shi + 1; }
-    if flo >= hhi { flo = hhi - 1; }
-    if thi <= shi { thi = shi + 1; }
-    if thi >= hhi { thi = hhi - 1; }
-    stem_edges[SE_SUB_LO] = slo;
-    stem_edges[SE_SUB_HI] = shi;
+    if blo < 1 { blo = 1; }
+    if bhi <= blo { bhi = blo + 1; }
+    if bdy <= bhi { bdy = bhi + 1; }
+    if mhi <= bdy { mhi = bdy + 1; }
+    if phi <= mhi { phi = mhi + 1; }
+    if ahi <= phi { ahi = phi + 1; }
+    if ahi > n / 2 { ahi = n / 2; }
+    if flo <= mhi { flo = mhi + 1; }
+    if flo >= ahi { flo = ahi - 1; }
+    if plo <= bhi { plo = bhi + 1; }
+    if plo >= flo { plo = flo - 1; }
+    if thi <= phi { thi = phi + 1; }
+    if thi >= ahi { thi = ahi - 1; }
+    stem_edges[SE_BASS_LO] = blo;
+    stem_edges[SE_BASS_HI] = bhi;
+    stem_edges[SE_BODY_HI] = bdy;
     stem_edges[SE_MID_HI] = mhi;
-    stem_edges[SE_HIGH_HI] = hhi;
+    stem_edges[SE_PRES_HI] = phi;
+    stem_edges[SE_AIR_HI] = ahi;
     stem_edges[SE_FLUX_LO] = flo;
-    stem_edges[SE_FLUX_HI] = hhi;
+    stem_edges[SE_FLUX_HI] = ahi;
+    stem_edges[SE_PLUCK_LO] = plo;
+    stem_edges[SE_PLUCK_HI] = flo;
     stem_edges[SE_TONAL_HI] = thi;
 }
 
@@ -467,7 +514,7 @@ fn fft(re: f32[:], im: f32[:], cos_t: f32[:], sin_t: f32[:], bitrev: i64[:]) {
 }
 
 // Fills one channel's window, runs the FFT, updates its spectrogram bands and
-// fills its four stem targets. Returns (rms, peak amplitude, onset strength).
+// fills its eight bus targets. Returns (rms, peak amplitude, onset strength).
 fn analyze(st: ChannelState&,
            window: f32[:], re: f32[:], im: f32[:],
            cos_t: f32[:], sin_t: f32[:], bitrev: i64[:],
@@ -489,7 +536,7 @@ fn analyze(st: ChannelState&,
 
     fft(re, im, cos_t, sin_t, bitrev);
 
-    // One magnitude array per channel feeds the bands, stem energies and flux.
+    // One magnitude array per channel feeds the bands, bus energies and flux.
     let ref = n as f32 / 4.0;   // full-scale sine after a Hann window
     for k in 1..n / 2 {
         st.mag[k] = sqrt(re[k] * re[k] + im[k] * im[k]);
@@ -508,44 +555,63 @@ fn analyze(st: ChannelState&,
         st.levels[b] += (target - st.levels[b]) * c;
     }
 
-    // --- stem energies -----------------------------------------------------
-    var e_sub: f32 = 0.0;
-    for k in stem_edges[SE_SUB_LO]..stem_edges[SE_SUB_HI] { e_sub += st.mag[k]; }
+    // --- bus energies ------------------------------------------------------
+    // Four contiguous regions above the bass. The tonal peak scan below uses
+    // the same edges, so a peak always lands in exactly one region.
+    var e_body: f32 = 0.0;
+    for k in stem_edges[SE_BASS_HI]..stem_edges[SE_BODY_HI] { e_body += st.mag[k]; }
     var e_mid: f32 = 0.0;
-    for k in stem_edges[SE_SUB_HI]..stem_edges[SE_MID_HI] { e_mid += st.mag[k]; }
-    var e_high: f32 = 0.0;
-    for k in stem_edges[SE_MID_HI]..stem_edges[SE_HIGH_HI] { e_high += st.mag[k]; }
-    let e_midhigh = e_mid + e_high;
+    for k in stem_edges[SE_BODY_HI]..stem_edges[SE_MID_HI] { e_mid += st.mag[k]; }
+    var e_pres: f32 = 0.0;
+    for k in stem_edges[SE_MID_HI]..stem_edges[SE_PRES_HI] { e_pres += st.mag[k]; }
+    var e_air: f32 = 0.0;
+    for k in stem_edges[SE_PRES_HI]..stem_edges[SE_AIR_HI] { e_air += st.mag[k]; }
+    var e_bass: f32 = 0.0;
+    for k in stem_edges[SE_BASS_LO]..stem_edges[SE_BASS_HI] { e_bass += st.mag[k]; }
+    let e_midhigh = e_body + e_mid + e_pres + e_air;
 
-    // Tonal energy: prominent local maxima, not every noise ripple. A
-    // 1.6x neighbour ratio is the harmonic/percussive split knob.
-    var e_peak: f32 = 0.0;
-    for k in stem_edges[SE_SUB_HI] + 1..stem_edges[SE_TONAL_HI] {
+    // Tonal energy: prominent local maxima, not every noise ripple. A 1.6x
+    // neighbour ratio is the harmonic/percussive split knob. Each peak is
+    // bucketed by region; the five tonal buses then share that energy.
+    var p_body: f32 = 0.0;
+    var p_mid: f32 = 0.0;
+    var p_pres: f32 = 0.0;
+    var p_air: f32 = 0.0;
+    for k in stem_edges[SE_BASS_HI] + 1..stem_edges[SE_TONAL_HI] {
         let m = st.mag[k];
         if m > ref * 0.02 && m > st.mag[k - 1] * 1.6 && m > st.mag[k + 1] * 1.6 {
-            e_peak += m;
+            if k < stem_edges[SE_BODY_HI] { p_body += m; }
+            else if k < stem_edges[SE_MID_HI] { p_mid += m; }
+            else if k < stem_edges[SE_PRES_HI] { p_pres += m; }
+            else { p_air += m; }
         }
     }
+    let p_total = p_body + p_mid + p_pres + p_air;
 
-    // Spectral flux over the high range: positive frame-to-frame changes.
+    // Spectral flux in two ranges: high for drum transients, low for plucks.
     let had_flux = st.flux_ready == 1;
-    var flux: f32 = 0.0;
+    var flux_hf: f32 = 0.0;
+    var flux_pluck: f32 = 0.0;
     if had_flux {
         for k in stem_edges[SE_FLUX_LO]..stem_edges[SE_FLUX_HI] {
             let d = st.mag[k] - st.prev_mag[k];
-            if d > 0.0 { flux += d; }
+            if d > 0.0 { flux_hf += d; }
+        }
+        for k in stem_edges[SE_PLUCK_LO]..stem_edges[SE_PLUCK_HI] {
+            let d = st.mag[k] - st.prev_mag[k];
+            if d > 0.0 { flux_pluck += d; }
         }
     }
-    for k in stem_edges[SE_FLUX_LO]..stem_edges[SE_FLUX_HI] {
+    for k in stem_edges[SE_PLUCK_LO]..stem_edges[SE_FLUX_HI] {
         st.prev_mag[k] = st.mag[k];
     }
     st.flux_ready = 1;
 
-    let hf_ratio = e_high / (e_midhigh + 0.000001);
+    let hf_ratio = e_air / (e_midhigh + 0.000001);
 
     // Adaptive onset: subtract the slowly adapting flux floor, so a steady
     // tonal shimmer or noise bed does not register as a drum hit.
-    let flux_norm = flux / ref;
+    let flux_norm = flux_hf / ref;
     var onset: f32 = 0.0;
     if had_flux {
         if st.flux_seen == 0 {
@@ -557,13 +623,43 @@ fn analyze(st: ChannelState&,
             st.flux_avg += (flux_norm - st.flux_avg) * flux_avg_coef;
         }
     }
-    var other_e = e_midhigh - e_peak * 0.9 - flux * 0.25;
-    if other_e < 0.0 { other_e = 0.0; }
 
-    st.stem_target[STEM_SUB] = db_level(e_sub, ref * 4.0);
+    // Shape descriptors: where the tonal energy sits, and whether it moves.
+    let shape = p_total + 0.000001;
+    let richness = (p_mid + p_pres) / shape;
+    let presence = (p_pres + p_air) / shape;
+    let pluck_norm = flux_pluck / ref;
+    let pluck = clamp01((pluck_norm - 0.02) / 0.35);
+
+    // Bus shape weights. These are display heuristics: each tonal bus claims
+    // a share of the same peak energy, biased toward its characteristic
+    // region. GUITAR follows low pluck flux, STRINGS dislikes percussion, and
+    // BRASS/VOCALS favour upper-harmonic or presence-heavy spectra.
+    var w_keys = p_body * 0.55 + p_mid * 1.00 + p_pres * 0.30;
+    var w_strings = (p_body * 0.25 + p_mid * 0.85 + p_pres * 0.85 + p_air * 0.45)
+                  * (1.0 - 0.35 * onset);
+    var w_brass = (p_body * 0.20 + p_mid * 1.00 + p_pres * 0.60 + p_air * 0.20)
+                * (0.55 + 0.45 * richness);
+    var w_guitar = (p_body * 1.00 + p_mid * 0.55 + p_pres * 0.20)
+                 * (0.50 + 0.50 * pluck);
+    var w_vocal = (p_body * 0.15 + p_mid * 0.50 + p_pres * 1.00 + p_air * 0.35)
+                * (0.60 + 0.40 * presence);
+    let wsum = w_keys + w_strings + w_brass + w_guitar + w_vocal + 0.000001;
+
+    // FX is what the tonal peaks and transient flux do not explain: broadband
+    // noise, cymbals, reverb tails and the 8-16 kHz air band.
+    var fx_e = e_midhigh - p_total * 0.9 - flux_hf * 0.25 - flux_pluck * 0.15;
+    if fx_e < 0.0 { fx_e = 0.0; }
+
+    let tonal_ref = ref * 0.55;
+    st.stem_target[STEM_BASS] = db_level(e_bass, ref * 4.0);
     st.stem_target[STEM_DRUM] = clamp01(onset * (0.45 + 0.55 * hf_ratio) + hf_ratio * 0.10);
-    st.stem_target[STEM_SYNTH] = db_level(e_peak, ref * 2.0);
-    st.stem_target[STEM_OTHER] = db_level(other_e, ref * 64.0);
+    st.stem_target[STEM_KEYS] = db_level(p_total * w_keys / wsum, tonal_ref);
+    st.stem_target[STEM_STRINGS] = db_level(p_total * w_strings / wsum, tonal_ref);
+    st.stem_target[STEM_BRASS] = db_level(p_total * w_brass / wsum, tonal_ref);
+    st.stem_target[STEM_GUITAR] = db_level(p_total * w_guitar / wsum, tonal_ref);
+    st.stem_target[STEM_VOCAL] = db_level(p_total * w_vocal / wsum, tonal_ref);
+    st.stem_target[STEM_FX] = db_level(fx_e, ref * 64.0);
     return rms, peak, onset;
 }
 
@@ -660,10 +756,12 @@ fn fill_bg(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
     hline(fb, w, h, px0, px0 + pw - 1, spec_y0 - 1, 24, 38, 68);
 }
 
-// Instrument bus summary across the stereo channels. Four cells (BASS,
-// DRUMS, KEYS, OTHER) each show L and R meters for that stem, plus a drum hit
-// blinker. This is a display grouping from the existing spectral analysis,
-// not a source-separation model.
+// Instrument bus summary across the stereo channels. Eight cells (BASS,
+// DRUMS, KEYS, STRINGS, BRASS, GUITAR, VOCALS, FX) each show L and R meters
+// for that bus, plus a drum hit blinker. This is a display grouping from the
+// existing spectral analysis, not a source-separation model. Narrow cells
+// switch to two-letter codes and tighter padding so all eight fit across a
+// 160-column terminal.
 fn draw_instrument_strip(fb: u8[:], w: i64, inst_h: i64,
                          states: ChannelState[>..]&, nch: i64, font: u8[:]) {
     fill_rect(fb, w, inst_h, 0, 0, w - 1, inst_h - 1, 10, 13, 22);
@@ -679,14 +777,18 @@ fn draw_instrument_strip(fb: u8[:], w: i64, inst_h: i64,
         if iscale < 1 { iscale = 1; }
         if iscale > 3 { iscale = 3; }
         let tiny = cw < 36;
-        let label = if tiny { instrument_letter(k) } else { stem_label(k, cw < 90) };
+        let inset = if tiny { 2 } else { 4 };
+        let gap = if tiny { 2 } else { 6 };
+        let label = if cw < 30 { stem_code(k) }
+                    else if cw < 90 { stem_label(k, true) }
+                    else { stem_label(k, false) };
         let label_w = label.len * (FONT_W + 1) * iscale - iscale;
         var ly = (inst_h - FONT_H * iscale) / 2;
         if ly < 0 { ly = 0; }
-        draw_text(fb, w, inst_h, cx0 + 4, ly, label, font, cr, cg, cb, iscale);
+        draw_text(fb, w, inst_h, cx0 + inset, ly, label, font, cr, cg, cb, iscale);
 
-        var bx0 = cx0 + 4 + label_w + 6;
-        let bx1 = cx1 - 4;
+        var bx0 = cx0 + inset + label_w + gap;
+        let bx1 = cx1 - inset;
         if bx1 > bx0 {
             var by0: i64 = 3;
             var by1: i64 = inst_h - 4;
@@ -754,7 +856,7 @@ fn draw_instrument_strip(fb: u8[:], w: i64, inst_h: i64,
             }
         }
 
-        if k == STEM_DRUM && inst_h >= 6 {
+        if k == STEM_DRUM && inst_h >= 6 && !tiny {
             var hit = states[0].hit_flash;
             if nch > 1 && states[1].hit_flash > hit { hit = states[1].hit_flash; }
             if hit > 0.03 {
@@ -776,43 +878,58 @@ fn draw_instrument_strip(fb: u8[:], w: i64, inst_h: i64,
     }
 }
 
-// Four labelled stem lanes. Each lane has a current-level meter, a peak-hold
-// marker, and a sparkline of its own level over the history pool. The drum
-// lane also shows a small hit blinker.
+// Eight labelled instrument lanes. Each lane has a current-level meter, a
+// peak-hold marker, and a sparkline of its own level over the history pool.
+// The drum lane also shows a small hit blinker. When the panel is too short
+// for eight readable rows, the lanes reflow into two columns of four.
 fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64, top: i64,
-                   lane_h: i64, st: ChannelState&, ch: i64, label_off: i64,
+                   lane_h: i64, lane_cols: i64, lane_rows: i64,
+                   st: ChannelState&, ch: i64, label_off: i64,
                    slots: i64[:], head: i64, count: i64, font: u8[:]) {
     var fscale = lane_h / 20;
     if fscale < 1 { fscale = 1; }
     if fscale > 3 { fscale = 3; }
-    let full_w = 5 * (FONT_W + 1) * fscale - fscale;
-    let short = pw < 4 + label_off + full_w + 12;
+    let full_w = 7 * (FONT_W + 1) * fscale - fscale;  // "STRINGS"
+    let lanes_bottom = top + lane_rows * lane_h;
     for s in STEMS {
-        let y0 = top + s * lane_h;
-        if y0 >= h { return; }
+        let col = s / lane_rows;
+        let row = s % lane_rows;
+        let cx0 = px0 + col * pw / lane_cols;
+        let cx1 = px0 + (col + 1) * pw / lane_cols;
+        let cw = cx1 - cx0;
+        if cw <= 0 { continue; }
+        var y0 = top + row * lane_h;
+        if y0 >= h { continue; }
         var y1 = y0 + lane_h - 1;
         if y1 >= h { y1 = h - 1; }
+        let off = if col == 0 { label_off } else { 0 };
         let cr, cg, cb = stem_color(s);
 
-        fill_rect(fb, w, h, px0, y0, px0 + pw - 1, y1, cr / 9, cg / 9, cb / 9);
-        fill_rect(fb, w, h, px0, y0, px0 + 1, y1, cr / 2, cg / 2, cb / 2);
-        if s + 1 < STEMS && y1 + 1 < h {
-            hline(fb, w, h, px0, px0 + pw - 1, y1, 26, 32, 44);
+        fill_rect(fb, w, h, cx0, y0, cx0 + cw - 1, y1, cr / 9, cg / 9, cb / 9);
+        fill_rect(fb, w, h, cx0, y0, cx0 + 1, y1, cr / 2, cg / 2, cb / 2);
+        if row + 1 < lane_rows && y1 + 1 < h {
+            hline(fb, w, h, cx0, cx0 + cw - 1, y1, 26, 32, 44);
+        }
+        if col + 1 < lane_cols {
+            fill_rect(fb, w, h, cx1 - 1, top, cx1 - 1, lanes_bottom - 1, 30, 36, 50);
         }
 
-        let label = stem_label(s, short);
+        // A two-letter code keeps the meter and sparkline usable when two
+        // columns squeeze each lane below about 56 pixels.
+        let short = cw < 4 + off + full_w + 12;
+        let label = if cw < 56 { stem_code(s) } else { stem_label(s, short) };
         if lane_h >= FONT_H * fscale {
             let ly = y0 + (lane_h - FONT_H * fscale) / 2;
-            draw_text(fb, w, h, px0 + 4 + label_off, ly, label, font, cr, cg, cb, fscale);
+            draw_text(fb, w, h, cx0 + 4 + off, ly, label, font, cr, cg, cb, fscale);
         }
 
         let label_w = label.len * (FONT_W + 1) * fscale - fscale;
-        var mx0 = px0 + 4 + label_off + label_w + 4;
-        let meter_w = max(8, pw / 8);
+        var mx0 = cx0 + 4 + off + label_w + 4;
+        let meter_w = max(8, cw / 8);
         var mx1 = mx0 + meter_w - 1;
-        if mx1 > px0 + pw - 4 { mx1 = px0 + pw - 4; }
+        if mx1 > cx0 + cw - 4 { mx1 = cx0 + cw - 4; }
         var sx0 = mx1 + 4;
-        var sx1 = px0 + pw - 4;
+        var sx1 = cx0 + cw - 4;
         if sx0 > sx1 { sx0 = sx1; }
 
         var bar_h = lane_h * 45 / 100;
@@ -845,7 +962,7 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64, top: i64,
             }
         }
 
-        // Sparkline: time on x, this stem's level on y, max over each pixel
+        // Sparkline: time on x, this bus's level on y, max over each pixel
         // so a one-frame transient survives downsampling.
         if count > 0 && sx1 > sx0 {
             let sy0 = y0 + 1;
@@ -885,7 +1002,7 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64, top: i64,
             if bs < 5 { bs = 5; }
             if bs > 10 { bs = 10; }
             if bs > lane_h - 2 { bs = lane_h - 2; }
-            let bx = px0 + pw - bs - 4;
+            let bx = cx0 + cw - bs - 4;
             let by = y0 + (lane_h - bs) / 2;
             let rr = (140.0 + 115.0 * st.hit_flash) as u8;
             let gg = (55.0 + 170.0 * st.hit_flash) as u8;
@@ -932,10 +1049,7 @@ fn draw_spectro(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
                 y0: i64, spec_h: i64, sub_bands: i64, ch: i64,
                 slots: i64[:], head: i64, count: i64) {
     if count <= 0 || spec_h <= 0 || pw <= 0 { return; }
-    let sr, sg, sb = stem_color(STEM_SUB);
-    let dr, dg, db = stem_color(STEM_DRUM);
-    let yr, yg, yb = stem_color(STEM_SYNTH);
-    let or_, og, ob = stem_color(STEM_OTHER);
+    let sr, sg, sb = stem_color(STEM_BASS);
     for k in count {
         let slot = slots[(head + k) % HIST];
         let x0 = px0 + k * pw / count;
@@ -943,21 +1057,22 @@ fn draw_spectro(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
         if x1 <= x0 { x1 = x0 + 1; }
         if x1 > px0 + pw { x1 = px0 + pw; }
 
-        // Mid/high bands take the colour of whichever stem is loudest in this
-        // history frame; low bands stay sub-blue. Picking the dominant stem
-        // keeps the waterfall readable instead of blending to grey.
-        let wd = history[slot].stems[ch * STEMS + STEM_DRUM];
-        let ws = history[slot].stems[ch * STEMS + STEM_SYNTH];
-        let wo = history[slot].stems[ch * STEMS + STEM_OTHER];
+        // Mid/high bands take the colour of whichever non-bass bus is loudest
+        // in this history frame; low bands stay bass-blue. Picking one
+        // dominant bus keeps the waterfall readable instead of blending to
+        // grey.
+        var dom: i64 = -1;
+        var wmax: f32 = 0.03;
+        for s in 1..STEMS {
+            let wv = history[slot].stems[ch * STEMS + s];
+            if wv > wmax { wmax = wv; dom = s; }
+        }
         var mr: f32 = 35.0;
         var mg: f32 = 42.0;
         var mb: f32 = 58.0;
-        if wd >= ws && wd >= wo && wd > 0.03 {
+        if dom >= 0 {
+            let dr, dg, db = stem_color(dom);
             mr = dr; mg = dg; mb = db;
-        } else if ws >= wo && ws > 0.03 {
-            mr = yr; mg = yg; mb = yb;
-        } else if wo > 0.03 {
-            mr = or_; mg = og; mb = ob;
         }
 
         for yy in spec_h {
@@ -993,16 +1108,27 @@ fn draw_scene(fb: u8[:], w: i64, h: i64,
     if h >= 64 && h < 72 && inst_h < 18 { inst_h = 18; }
     if inst_h > h / 4 { inst_h = h / 4; }
     if inst_h < 4 { inst_h = 4; }
-    // The cross-channel strip needs four readable cells; below that width
+    // The cross-channel strip needs eight readable cells; below that width
     // the per-channel panels keep the full height and still show all buses.
     if w < 160 { inst_h = 0; }
 
     let content_h = h - inst_h;
-    var lane_h = (content_h * 56 / 100) / STEMS;
+    var lane_cols = 1;
+    var lane_rows = STEMS;
+    var lane_h = (content_h * 56 / 100) / lane_rows;
+    // Eight rows leave no room for a 7-pixel label in a short terminal.
+    // Reflow to two columns of four when that buys a readable glyph row.
+    if lane_h < FONT_H && content_h >= 4 * FONT_H + 4 {
+        lane_cols = 2;
+        lane_rows = STEMS / 2;
+        lane_h = (content_h * 56 / 100) / lane_rows;
+    }
     if lane_h < 2 { lane_h = 2; }
-    if lane_h < 8 && content_h >= 4 * 8 + 4 { lane_h = 8; }
-    if lane_h * STEMS > content_h - 4 { lane_h = max(2, (content_h - 4) / STEMS); }
-    let lanes_h = lane_h * STEMS;
+    if lane_h < 8 && content_h >= lane_rows * 8 + 4 { lane_h = 8; }
+    if lane_h * lane_rows > content_h - 4 {
+        lane_h = max(2, (content_h - 4) / lane_rows);
+    }
+    let lanes_h = lane_h * lane_rows;
 
     var wave_h = content_h * 9 / 100;
     if wave_h < 3 { wave_h = 3; }
@@ -1034,8 +1160,8 @@ fn draw_scene(fb: u8[:], w: i64, h: i64,
             label_off = (FONT_W + 1) * fscale + 6;
         }
 
-        draw_stem_lanes(fb, w, h, px0, pw, inst_h, lane_h, states[ch], ch, label_off,
-                        slots, head, count, font);
+        draw_stem_lanes(fb, w, h, px0, pw, inst_h, lane_h, lane_cols, lane_rows,
+                        states[ch], ch, label_off, slots, head, count, font);
 
         if nch > 1 && lane_h >= FONT_H * fscale {
             let badge = channel_label(ch, nch);
@@ -1128,7 +1254,8 @@ fn usage() {
     print("  --help            this text");
     print("");
     print("keys: q quit, s toggle synthetic/live, p pause, space clear peaks");
-    print("buses: BASS low, DRUMS flux/HF transients, KEYS harmonic peaks, OTHER residual");
+    print("buses: BASS low; DRUMS flux/HF transients; KEYS, STRINGS, BRASS,");
+    print("       GUITAR and VOCALS split harmonic peaks by spectral shape; FX residual");
 }
 
 fn clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
@@ -1244,7 +1371,7 @@ fn main() {
     setup_font(font[..]);
 
     var sub_bands: i64 = 0;
-    while sub_bands < BANDS && band_lo[sub_bands] < stem_edges[SE_SUB_HI] {
+    while sub_bands < BANDS && band_lo[sub_bands] < stem_edges[SE_BASS_HI] {
         sub_bands += 1;
     }
 
@@ -1255,14 +1382,22 @@ fn main() {
     let band_rel = coef(dt, 0.250);
     var stem_att: f32[STEMS] = [0.0; STEMS];
     var stem_rel: f32[STEMS] = [0.0; STEMS];
-    stem_att[STEM_SUB] = coef(dt, 0.020);
-    stem_rel[STEM_SUB] = coef(dt, 0.300);
+    stem_att[STEM_BASS] = coef(dt, 0.020);
+    stem_rel[STEM_BASS] = coef(dt, 0.300);
     stem_att[STEM_DRUM] = coef(dt, 0.006);
     stem_rel[STEM_DRUM] = coef(dt, 0.160);
-    stem_att[STEM_SYNTH] = coef(dt, 0.020);
-    stem_rel[STEM_SYNTH] = coef(dt, 0.350);
-    stem_att[STEM_OTHER] = coef(dt, 0.030);
-    stem_rel[STEM_OTHER] = coef(dt, 0.400);
+    stem_att[STEM_KEYS] = coef(dt, 0.020);
+    stem_rel[STEM_KEYS] = coef(dt, 0.350);
+    stem_att[STEM_STRINGS] = coef(dt, 0.030);
+    stem_rel[STEM_STRINGS] = coef(dt, 0.450);
+    stem_att[STEM_BRASS] = coef(dt, 0.012);
+    stem_rel[STEM_BRASS] = coef(dt, 0.220);
+    stem_att[STEM_GUITAR] = coef(dt, 0.008);
+    stem_rel[STEM_GUITAR] = coef(dt, 0.260);
+    stem_att[STEM_VOCAL] = coef(dt, 0.025);
+    stem_rel[STEM_VOCAL] = coef(dt, 0.400);
+    stem_att[STEM_FX] = coef(dt, 0.030);
+    stem_rel[STEM_FX] = coef(dt, 0.400);
     let stem_peak_decay = (dt * 0.55) as f32;
     let hit_decay = exp(-dt / 0.110) as f32;
     let flux_avg_coef = coef(dt, 0.70);
@@ -1271,7 +1406,7 @@ fn main() {
 
     // Preallocate both bounded pools once. Channel states are per channel but
     // the pool holds the compile-time maximum, so any capture count up to
-    // CH_MAX fits without growth. History holds per-channel spectra/stems.
+    // CH_MAX fits without growth. History holds per-channel spectra/bus levels.
     for i in CH_MAX {
         channel_state.alloc_index(new_channel());
     }
@@ -1471,7 +1606,7 @@ fn main() {
                     channel_state[c].hit_cooldown -= 1;
                 }
 
-                // One-pole attack/release per stem, per channel. Peak hold
+                // One-pole attack/release per bus, per channel. Peak hold
                 // falls at a fixed rate per second.
                 for st in STEMS {
                     let t = channel_state[c].stem_target[st];
@@ -1646,10 +1781,14 @@ fn main() {
               " pool=", history.len, "/", HIST, " audio_s=", audio_frames / SR);
         for c in nch {
             print("       ch ", c,
-                  " bass=", (channel_state[c].stem_level[STEM_SUB] * 100.0) as i64,
+                  " bass=", (channel_state[c].stem_level[STEM_BASS] * 100.0) as i64,
                   " drums=", (channel_state[c].stem_level[STEM_DRUM] * 100.0) as i64,
-                  " keys=", (channel_state[c].stem_level[STEM_SYNTH] * 100.0) as i64,
-                  " other=", (channel_state[c].stem_level[STEM_OTHER] * 100.0) as i64,
+                  " keys=", (channel_state[c].stem_level[STEM_KEYS] * 100.0) as i64,
+                  " strings=", (channel_state[c].stem_level[STEM_STRINGS] * 100.0) as i64);
+            print("            brass=", (channel_state[c].stem_level[STEM_BRASS] * 100.0) as i64,
+                  " guitar=", (channel_state[c].stem_level[STEM_GUITAR] * 100.0) as i64,
+                  " vox=", (channel_state[c].stem_level[STEM_VOCAL] * 100.0) as i64,
+                  " fx=", (channel_state[c].stem_level[STEM_FX] * 100.0) as i64,
                   " hits=", channel_state[c].hit_count);
         }
         print("       onset_avg=", ((onset_sum / max(1, frames_done * nch)) * 100.0) as i64,

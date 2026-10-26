@@ -101,30 +101,44 @@ slices, and printing.
   A mono device is the degenerate one-channel case.
 - the hot loop keeps a 2048-sample ring per channel, applies a Hann window and
   runs an in-place radix-2 FFT. Twiddles and the bit-reversal table are built
-  once. Each channel gets its own 64-band bank and four labelled instrument
-  buses:
+  once. Each channel gets its own 64-band bank and eight labelled instrument
+  buses. The split is heuristic: frequency regions and spectral shape assign
+  energy to buses, and the five tonal buses share the same detected harmonic
+  peaks, so they overlap. It is not source separation.
   - `BASS` — low energy, 30–180 Hz, blue.
   - `DRUMS` — high-band spectral flux (1.5–16 kHz) with an adaptive flux
     floor, a fast transient envelope and a high-frequency ratio; amber, with a
     compact hit blinker. A 100 ms refractory stops one hit from retriggering.
-  - `KEYS` — prominent harmonic peaks from 180 Hz to 8 kHz (the tonal/synth
-    content), where a bin must be a local maximum and at least 1.6x its
-    neighbours; cyan/green.
-  - `OTHER` — the broadband mid/high residual after subtracting tonal peaks
-    and transient flux; violet.
-- a top **instrument-bus strip** summarizes BASS, DRUMS, KEYS and OTHER
-  across stereo: each cell has a mirrored L/R meter (L left, R right) with peak
-  holds, and DRUMS gets a hit blinker. It is a compact cross-channel view, not
-  extra audio capture. The strip is shown at 160 columns or wider; narrower
-  terminals give the full height to the L/R panels, which still have all four
+  - `KEYS` — harmonic peaks weighted toward the 180–800 Hz body and the
+    800 Hz–2.5 kHz mid; mint.
+  - `STRINGS` — harmonic peaks weighted toward the 2.5–5 kHz presence and
+    5–8 kHz air, with a sustain factor (percussive onsets reduce it); sky blue.
+  - `BRASS` — harmonic peaks with strong mid/upper-harmonic richness; gold.
+  - `GUITAR` — harmonic peaks weighted toward the 180–800 Hz body, boosted by
+    low-band (180–1500 Hz) pluck flux; magenta.
+  - `VOCALS` — harmonic peaks weighted toward the 2.5–5 kHz presence region,
+    with an air term; rose. This is a display grouping only: it does not
+    isolate a voice.
+  - `FX` — the broadband residual after subtracting tonal peaks and transient
+    flux: noise, cymbals, reverb tails and the 8–16 kHz air band; slate.
+- a top **instrument-bus strip** summarizes all eight buses across stereo:
+  each cell has a mirrored L/R meter (L left, R right) with peak holds, and
+  DRUMS gets a hit blinker. It is a compact cross-channel view, not extra audio
+  capture. The strip is shown at 160 columns or wider. At 160 columns each cell
+  is only 20 pixels wide, so the strip uses two-letter codes (`BA DR KE ST BR
+  GT VO FX`) and tight padding; full names return at wider sizes. Narrower
+  terminals give the full height to the L/R panels, which still have all eight
   instrument lanes.
 - channels render as side-by-side panels. Mono shows one full-width panel;
   stereo shows `L`/`R`; up to `CH_MAX = 8` channels get `1`…`8` badges. Each
-  panel has the four labelled instrument lanes, a waveform strip, and a
+  panel has the eight labelled instrument lanes, a waveform strip, and a
   bus-tinted 96-column spectrogram. Every lane has a 5x7 pixel label, a
   current-level meter, a peak-hold marker, and a sparkline of its own level
-  over the shared history pool. With more than two channels the top strip
-  summarizes L/R (channels 0 and 1); the panels show all channels.
+  over the shared history pool. When eight rows would leave less than one
+  glyph row (short terminals), the lanes reflow into two columns of four and
+  use two-letter labels, so all eight stay readable. With more than two
+  channels the top strip summarizes L/R (channels 0 and 1); the panels show all
+  channels.
 - a software RGB framebuffer is drawn from the channel panels. The terminal
   path turns each 1x2 pixel pair into a `▀` with truecolor foreground and
   background; `--png` writes the same framebuffer as a PNG. `src/host.c`
@@ -160,19 +174,27 @@ slices, and printing.
 - synthetic source: defaults to stereo, pans tonal content left and percussion
   right while keeping bass centred; `--channels 1` restores the mono mix;
 - instrument buses are display groupings from spectral features, not true
-  source separation. They cannot isolate vocals or arbitrary instruments; a
-  real separator (for example Demucs) would be a separate ML/offline
-  dependency and is deliberately not included;
-- band edges at the top: `SUB_HZ_LO/HI` 30/180 Hz, `MID_HZ_HI` 2 kHz,
-  `HIGH_HZ_HI` 16 kHz, `FLUX_HZ_LO` 1.5 kHz, `TONAL_HZ_HI` 8 kHz;
+  source separation. The five tonal buses share the same harmonic peaks and
+  differ only in weighting, so they overlap; the `VOCALS` lane does not isolate
+  a voice and `GUITAR`/`BRASS`/`STRINGS` cannot identify real instruments. A
+  real separator (for example Demucs) would be a separate ML/offline dependency
+  and is deliberately not included;
+- band edges at the top: `BASS_HZ_LO/HI` 30/180 Hz, `BODY_HZ_HI` 800 Hz,
+  `MID_HZ_HI` 2.5 kHz, `PRES_HZ_HI` 5 kHz, `AIR_HZ_HI` 16 kHz,
+  `FLUX_HZ_LO` 1.5 kHz, `PLUCK_HZ_LO` 180 Hz, `TONAL_HZ_HI` 8 kHz;
+- tonal bus shape weights are in `analyze()`: each tonal bus claims a share of
+  the common peak energy from the body/mid/presence/air buckets, then GUITAR
+  follows low pluck flux, STRINGS falls with percussion onset, BRASS follows
+  harmonic richness and VOCALS follows presence energy;
 - harmonic prominence: a tonal bin must exceed its neighbours by 1.6x;
 - onset: flux floor factor 1.4, onset threshold 0.30, 100 ms refractory; the
   flux baseline adapts with a 0.70 s time constant;
-- lane energy references: sub ×4, synth ×2, other ×64 relative to a
+- lane energy references: bass ×4, tonal ×0.55, fx ×64 relative to a
   full-scale sine (N/4), inside `analyze()`;
-- attack/release time constants: spectrogram bands 20/250 ms, sub 20/300 ms,
-  drum 6/160 ms, synth 20/350 ms, other 30/400 ms; peak-hold falls 0.55/s;
-  blinker decays with a 110 ms time constant.
+- attack/release time constants: spectrogram bands 20/250 ms, bass 20/300 ms,
+  drums 6/160 ms, keys 20/350 ms, strings 30/450 ms, brass 12/220 ms, guitar
+  8/260 ms, vocals 25/400 ms, fx 30/400 ms; peak-hold falls 0.55/s; blinker
+  decays with a 110 ms time constant.
 
 `pixi run stack-stats`, `pixi run realtime-stack-stats` and
 `pixi run viz-stack-stats` add `-DGS_STACK_STATS=1` and report the
@@ -462,12 +484,14 @@ goose runtime a5dbd11b6309
   prebuilt compiler release with the packages built in. The visualizer does
   not use these packages.
 - **Instrument buses are heuristics, not source separation.** BASS/DRUMS/
-  KEYS/OTHER are display groupings from low-band energy, spectral flux and
-  harmonic peak prominence in the existing FFT. They can show whether a
-  passage is bass-, drum- or tonal-heavy and where it sits in L/R, but they do
-  not isolate vocals or arbitrary instruments and they leak between buses. A
-  true separator (for example Demucs) would add a heavy ML/offline dependency;
-  ask before adding one.
+  KEYS/STRINGS/BRASS/GUITAR/VOCALS/FX are display groupings from low-band
+  energy, spectral flux, harmonic peak prominence and spectral shape in the
+  existing FFT. They can show whether a passage is bass-, drum- or tonal-heavy,
+  roughly where the tonal energy sits, and whether it moves in L/R, but the
+  five tonal buses share the same peaks and leak into each other. VOCALS does
+  not isolate a voice, and GUITAR/BRASS/STRINGS cannot identify real
+  instruments. A true separator (for example Demucs) would add a heavy
+  ML/offline dependency; ask before adding one.
 - **Audio capture needs a device and an audio backend.** The sidecar uses
   miniaudio, which loads `libasound.so.2`, `libpulse.so.0` or JACK with
   `dlopen` at run time. No development headers or extra pixi packages are
@@ -526,9 +550,10 @@ smaller FFT-only sketch of the same hot loop.
 - `realtime.goose` — fixed-cadence loop: per-tick stack scratch, a bounded
   outbox in a `reusable` pool, and explicit drop-on-full backpressure.
 - `visualizer.goose` — realtime multi-channel instrument-bus visualizer:
-  per-channel Hann window, FFT, bass/drums/keys/other lanes, a stereo
-  instrument summary, side-by-side channel panels, flux onsets, harmonic
-  peaks, ANSI terminal and PNG output.
+  per-channel Hann window, FFT, eight instrument-bus lanes (bass, drums, keys,
+  strings, brass, guitar, vocals, fx), a stereo instrument summary,
+  side-by-side channel panels, flux onsets, harmonic peaks, ANSI terminal and
+  PNG output.
 - `visualizer.build` — the sidecar: compiles `src/*.c` and links `m`,
   `pthread` and `dl`.
 - `src/capture.c` — miniaudio capture with native/requested channels,

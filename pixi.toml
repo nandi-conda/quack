@@ -12,7 +12,7 @@ demo = "goose demo.goose"
 iteration = "goose iteration.goose"
 # A fixed-cadence loop: stack scratch, bounded outbox, explicit backpressure.
 realtime = "goose realtime.goose"
-# Realtime multi-channel stem-aware visualizer: live capture, FFT, four lanes/channel, ANSI.
+# Realtime multi-channel instrument-bus visualizer: live capture, FFT, eight lanes/channel, ANSI.
 viz = "goose --stack-reserve 64M visualizer.goose"
 # Typecheck every program.
 check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose && goose check visualizer.goose"
@@ -33,7 +33,7 @@ screenshot = "goose --stack-reserve 64M visualizer.goose -- --synthetic --channe
 # Headless hot-loop measurements: JIT and native.
 viz-bench = "goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 2 --bench --frames 240 --width 960 --height 540"
 viz-bench-native = { cmd = "./visualizer --synthetic --channels 2 --bench --frames 600 --width 960 --height 540", depends-on = ["build-viz"] }
-# Exercise the compile-time channel maximum (8 lanes).
+# Exercise the compile-time channel maximum (8 channels).
 viz-bench-8ch = "goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 8 --bench --frames 120 --width 960 --height 540"
 # Report the visualizer's data-stack high-water mark after one render.
 viz-stack-stats = "goose --stack-reserve 64M -DGS_STACK_STATS=1 visualizer.goose -- --synthetic --channels 2 --bench --frames 1"
