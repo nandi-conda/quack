@@ -8,12 +8,17 @@ version = "0.1.0"
 [tasks]
 # Compile and run demo.goose in-process with the bundled TinyCC backend.
 demo = "goose demo.goose"
-# Typecheck only.
-check = "goose check demo.goose"
-# Build a native executable named `demo` beside the source.
-build = "goose build demo.goose"
-# Build, then run the native executable.
+# A request/iteration-scoped loop: per-request scratch plus a bounded ring.
+iteration = "goose iteration.goose"
+# Typecheck both programs.
+check = "goose check demo.goose && goose check iteration.goose"
+# Build native executables beside the sources.
+build = "goose build demo.goose && goose build iteration.goose"
+# Build both, then run one of the native executables.
 run-native = { cmd = "./demo", depends-on = ["build"] }
+run-iteration-native = { cmd = "./iteration", depends-on = ["build"] }
+# Run the request loop and report its data-stack high-water mark.
+stack-stats = "goose -DGS_STACK_STATS=1 iteration.goose"
 # Report the runtime version and the C toolchain Goose found.
 version = "goose version"
 toolchain = "goose toolchain"
