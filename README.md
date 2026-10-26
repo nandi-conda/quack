@@ -120,6 +120,8 @@ slices, and printing.
   switches to a deterministic synthetic riff, so the FFT and renderer still
   run. `--synthetic` forces the test signal, `--live` forces the silent device.
 - keys: `q` quit, `s` toggle synthetic/live, `p` pause, space clears peaks.
+- quick start: `pixi run viz`; see
+  [Run the visualizer](#run-the-visualizer) for native, PNG and flag forms.
 
 `pixi run stack-stats`, `pixi run realtime-stack-stats` and
 `pixi run viz-stack-stats` add `-DGS_STACK_STATS=1` and report the
@@ -159,6 +161,58 @@ is §6.3.
 
 ## Run
 
+### Run the visualizer
+
+The visualizer is a **terminal UI, not a windowed GUI**. It draws truecolor
+half-blocks in the current terminal; there is no SDL/gfx window in this
+package. If by GUI you mean a window, this environment cannot open one: the
+`gfx` package is not built into the pinned conda Goose (see
+[Platform caveats](#platform-caveats)). The terminal UI and the PNG output are
+the supported renderers. From the project root:
+
+```bash
+pixi install          # once
+pixi run viz          # live capture if a device exists, else synthetic
+```
+
+Quit with `q` (or Ctrl-C). The same UI from a native build:
+
+```bash
+pixi run run-viz-native
+```
+
+Headless output instead of the terminal:
+
+```bash
+pixi run screenshot   # writes screenshots/visualizer.png (960x540)
+pixi run viz-bench    # hot-loop benchmark, no terminal or window
+pixi run viz-bench-native
+```
+
+To pass flags, use the direct Goose command; options go after `--`:
+
+```bash
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --png /tmp/vis.png --frames 240
+pixi run goose --stack-reserve 64M visualizer.goose -- --list
+pixi run goose --stack-reserve 64M visualizer.goose -- --device "USB" --fps 60
+```
+
+For a pixi task, a second `--` is needed to reach the program:
+`pixi run viz -- -- --synthetic --seconds 5`.
+
+**Live capture requirements:** `pixi run viz` opens the default capture device
+through miniaudio (ALSA, PulseAudio or JACK, loaded at run time) at 48 kHz mono
+f32. No audio development headers or extra pixi packages are needed. If the
+machine has no capture device (container, CI, no `/dev/snd`), miniaudio falls
+back to its Null backend and the program says so and uses its deterministic
+synthetic signal. `--list` shows devices, `--device NAME` picks one by name
+substring, and `--live` keeps a silent device instead of switching to synthetic.
+Terminal mode needs a TTY with 24-bit color; if stdout is not a TTY the program
+exits with a hint, so use `pixi run screenshot` or `--png`/`--bench` instead.
+
+### All tasks
+
 ```bash
 pixi run demo                   # basic demo, in-process
 pixi run iteration              # heap-less request/ring demo, in-process
@@ -189,12 +243,12 @@ pixi run goose iteration.goose
 pixi run goose realtime.goose
 pixi run goose build realtime.goose && ./realtime
 
-pixi run goose visualizer.goose                        # live capture, terminal
-pixi run goose visualizer.goose -- --synthetic --seconds 5
-pixi run goose visualizer.goose -- --synthetic --png /tmp/vis.png --frames 240
-pixi run goose visualizer.goose -- --list              # capture devices
-pixi run goose visualizer.goose -- --bench --frames 240
-pixi run goose build visualizer.goose && ./visualizer --synthetic
+pixi run goose --stack-reserve 64M visualizer.goose                        # live capture, terminal
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --png /tmp/vis.png --frames 240
+pixi run goose --stack-reserve 64M visualizer.goose -- --list              # capture devices
+pixi run goose --stack-reserve 64M visualizer.goose -- --bench --frames 240
+pixi run goose build --stack-reserve 64M visualizer.goose && ./visualizer --synthetic
 ```
 
 Expected output of `pixi run demo`:
