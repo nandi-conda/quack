@@ -729,3 +729,5 @@ pixi run goose build docs/examples/pool-generations.goose && ./docs/examples/poo
 ```
 
 `request-loop.goose` reads request lines of the form `GET /path bytes` from stdin and prints counters. `minihttp.goose` needs `net.c` and `minihttp.build` in the same directory; the sidecar must be named after the root file. `fanout.goose` and the other threaded examples need `goose build`, not a JIT run.
+
+The sample project at the repository root adds two smaller demos in the same style: `iteration.goose` (a request loop with a bounded reusable pool ring; `pixi run iteration`) and `realtime.goose` (a fixed-cadence loop with a deliberately slow consumer and a bounded outbox; `pixi run realtime`). `pixi run stack-stats` and `pixi run realtime-stack-stats` print the compiler-assigned data stacks and regions at exit.
