@@ -12,7 +12,7 @@ demo = "goose demo.goose"
 iteration = "goose iteration.goose"
 # A fixed-cadence loop: stack scratch, bounded outbox, explicit backpressure.
 realtime = "goose realtime.goose"
-# Realtime audio visualizer: live capture, FFT, ANSI truecolor terminal.
+# Realtime stem-aware audio visualizer: live capture, FFT, four lanes, ANSI.
 viz = "goose --stack-reserve 64M visualizer.goose"
 # Typecheck every program.
 check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose && goose check visualizer.goose"
