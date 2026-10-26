@@ -12,17 +12,29 @@ demo = "goose demo.goose"
 iteration = "goose iteration.goose"
 # A fixed-cadence loop: stack scratch, bounded outbox, explicit backpressure.
 realtime = "goose realtime.goose"
+# Realtime audio visualizer: live capture, FFT, ANSI truecolor terminal.
+viz = "goose --stack-reserve 64M visualizer.goose"
 # Typecheck every program.
-check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose"
+check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose && goose check visualizer.goose"
 # Build native executables beside the sources.
-build = "goose build demo.goose && goose build iteration.goose && goose build realtime.goose"
+build = "goose build demo.goose && goose build iteration.goose && goose build realtime.goose && goose build --stack-reserve 64M visualizer.goose"
+# Build only the visualizer's executable (its C sidecar takes a few seconds).
+build-viz = "goose build --stack-reserve 64M visualizer.goose"
 # Build all, then run one of the native executables.
 run-native = { cmd = "./demo", depends-on = ["build"] }
 run-iteration-native = { cmd = "./iteration", depends-on = ["build"] }
 run-realtime-native = { cmd = "./realtime", depends-on = ["build"] }
+run-viz-native = { cmd = "./visualizer", depends-on = ["build-viz"] }
 # Report each loop's data-stack high-water mark.
 stack-stats = "goose -DGS_STACK_STATS=1 iteration.goose"
 realtime-stack-stats = "goose -DGS_STACK_STATS=1 realtime.goose"
+# Offscreen render of the same framebuffer the terminal uses, for the README.
+screenshot = "goose --stack-reserve 64M visualizer.goose -- --synthetic --png screenshots/visualizer.png --frames 240 --width 960 --height 540"
+# Headless hot-loop measurements: JIT and native.
+viz-bench = "goose --stack-reserve 64M visualizer.goose -- --synthetic --bench --frames 240 --width 960 --height 540"
+viz-bench-native = { cmd = "./visualizer --synthetic --bench --frames 600 --width 960 --height 540", depends-on = ["build-viz"] }
+# Report the visualizer's data-stack high-water mark after one render.
+viz-stack-stats = "goose --stack-reserve 64M -DGS_STACK_STATS=1 visualizer.goose -- --synthetic --bench --frames 1"
 # Report the runtime version and the C toolchain Goose found.
 version = "goose version"
 toolchain = "goose toolchain"

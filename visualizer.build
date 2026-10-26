@@ -1,0 +1,6 @@
+// visualizer.build -- the sidecar C for visualizer.goose (docs/packages.md).
+// capture.c: miniaudio capture into a fixed SPSC ring.
+// host.c:    raw terminal, size, non-blocking keys, PNG writer (stb).
+c_sources = ["src/capture.c", "src/host.c"];
+c_include = ["vendor"];
+c_libs = ["m", "pthread", "dl"];
