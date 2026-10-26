@@ -93,9 +93,21 @@ goose stack stats: main: 1 data stacks, 4 regions (reserving 2 GB each); budget 
 ```
 
 The reservation is address space, not committed memory; it is the upper bound
-for all dynamic data. This is the pattern for request-, job-, frame-, or
-batch-scoped work. Per-unit scratch belongs in locals; state that outlives one
-unit must be bounded up front and pooled.
+for all dynamic data. The default is 2 GB *virtual* per data stack, so the
+process VSZ can look large on a small VM even when RSS is tiny. Lower it for a
+constrained container or a strict `RLIMIT_AS`:
+
+```bash
+pixi run goose --stack-reserve 64M iteration.goose   # minimum is 64 KB
+```
+
+The runtime halves a reservation the platform refuses. This is the pattern for
+request-, job-, frame-, or batch-scoped work. Per-unit scratch belongs in
+locals; state that outlives one unit must be bounded up front and pooled.
+
+The request loop is the "scope is the unit of work" pattern analysed in
+[`docs/heap-less-app-guide.md`](docs/heap-less-app-guide.md) §6.1; the pool ring
+is §6.3.
 
 ## Run
 
@@ -206,6 +218,10 @@ goose runtime a5dbd11b6309
 - `goose build` delegates to the host C compiler and needs `gcc`/`clang`.
   It writes the generated C and runtime objects under `GOOSE_HOME`
   (default `~/.goose`), not into this directory.
+- **Threads need a native build.** The in-process TinyCC backend cannot place
+  thread-local storage, so a program that starts `thread_fn` workers must be
+  run with `goose build` (for example `pixi run run-realtime-native`). The
+  three demos are single-threaded and run in-process.
 - `realtime.goose` uses a **simulated** timer: deadlines are logical tick
   numbers, not wall-clock sleeps. It measures compute time, so OS scheduling
   jitter is excluded. It demonstrates the allocation and backpressure shape,
