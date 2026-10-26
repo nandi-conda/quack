@@ -12,7 +12,7 @@ demo = "goose demo.goose"
 iteration = "goose iteration.goose"
 # A fixed-cadence loop: stack scratch, bounded outbox, explicit backpressure.
 realtime = "goose realtime.goose"
-# Realtime multi-channel instrument-bus visualizer: live capture, FFT, eight lanes/channel, ANSI.
+# Realtime multi-channel instrument-bus visualizer: live capture, FFT, one full-width eight-lane view, ANSI.
 viz = "goose --stack-reserve 64M visualizer.goose"
 # Typecheck every program.
 check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose && goose check visualizer.goose"

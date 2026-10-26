@@ -89,9 +89,9 @@ slices, and printing.
 
 `visualizer.goose` is the realtime multi-channel instrument-bus visualizer:
 
-| Offscreen 960x540, stereo (`pixi run screenshot`) | ANSI terminal, 160×40 pty |
+| Offscreen 960x540 (`pixi run screenshot`) | ANSI terminal, 160×40 pty |
 | --- | --- |
-| ![Stereo instrument panels](screenshots/visualizer.png) | ![ANSI terminal](screenshots/terminal.png) |
+| ![Full-width instrument lanes](screenshots/visualizer.png) | ![ANSI terminal](screenshots/terminal.png) |
 
 - `src/capture.c` opens the default capture device through vendored
   miniaudio with its **native channel count** (or `--channels N`): 48 kHz
@@ -101,10 +101,12 @@ slices, and printing.
   A mono device is the degenerate one-channel case.
 - the hot loop keeps a 2048-sample ring per channel, applies a Hann window and
   runs an in-place radix-2 FFT. Twiddles and the bit-reversal table are built
-  once. Each channel gets its own 64-band bank and eight labelled instrument
-  buses. The split is heuristic: frequency regions and spectral shape assign
-  energy to buses, and the five tonal buses share the same detected harmonic
-  peaks, so they overlap. It is not source separation.
+  once. Each input channel gets its own 64-band bank and eight instrument-bus
+  analyses, but the UI is one shared eight-lane view: a lane or strip cell
+  shows the per-bus maximum across the active channels instead of drawing a
+  left and a right copy. The split is heuristic: frequency regions and spectral
+  shape assign energy to buses, and the five tonal buses share the same
+  detected harmonic peaks, so they overlap. It is not source separation.
   - `BASS` — low energy, 30–180 Hz, blue.
   - `DRUMS` — high-band spectral flux (1.5–16 kHz) with an adaptive flux
     floor, a fast transient envelope and a high-frequency ratio; amber, with a
@@ -121,38 +123,43 @@ slices, and printing.
     isolate a voice.
   - `FX` — the broadband residual after subtracting tonal peaks and transient
     flux: noise, cymbals, reverb tails and the 8–16 kHz air band; slate.
-- a top **instrument-bus strip** summarizes all eight buses across stereo:
-  each cell has a mirrored L/R meter (L left, R right) with peak holds, and
-  DRUMS gets a hit blinker. It is a compact cross-channel view, not extra audio
-  capture. The strip is shown at 160 columns or wider. At 160 columns each cell
-  is only 20 pixels wide, so the strip uses two-letter codes (`BA DR KE ST BR
-  GT VO FX`) and tight padding; full names return at wider sizes. Narrower
-  terminals give the full height to the L/R panels, which still have all eight
-  instrument lanes.
-- channels render as side-by-side panels. Mono shows one full-width panel;
-  stereo shows `L`/`R`; up to `CH_MAX = 8` channels get `1`…`8` badges. Each
-  panel has the eight labelled instrument lanes, a waveform strip, and a
-  bus-tinted 96-column spectrogram. Every lane has a 5x7 pixel label, a
-  current-level meter, a peak-hold marker, and a sparkline of its own level
-  over the shared history pool. When eight rows would leave less than one
-  glyph row (short terminals), the lanes reflow into two columns of four and
-  use two-letter labels, so all eight stay readable. With more than two
-  channels the top strip summarizes L/R (channels 0 and 1); the panels show all
-  channels.
-- a software RGB framebuffer is drawn from the channel panels. The terminal
-  path turns each 1x2 pixel pair into a `▀` with truecolor foreground and
-  background; `--png` writes the same framebuffer as a PNG. `src/host.c`
+- a top **instrument-bus strip** summarizes all eight buses for the whole
+  input: each cell has one meter for that bus with a peak hold, and DRUMS gets a
+  hit blinker. It is a compact summary driven by the same analysis, not extra
+  audio capture. The strip is shown at 160 columns or wider. At 160 columns
+  each cell is only 20 pixels wide, so the strip stacks the two-letter code
+  (`BA DR KE ST BR GT VO FX`) over a nearly full-width meter; wider cells put
+  the label beside a longer meter, and full names return at the widest sizes.
+  Narrower terminals give the full height to the lanes.
+- there are no L/R panels. The eight instrument lanes, the waveform strip and
+  the bus-tinted 96-column spectrogram are drawn once across the full width,
+  so each instrument is shown once instead of once per channel. Every lane has
+  a 5x7 pixel label, a current-level meter, a peak-hold marker, and a sparkline
+  of that bus over the shared history pool. When eight rows would leave less
+  than one glyph row (short terminals), the lanes reflow into two columns of
+  four, so all eight stay readable; at 160×40 each lane is about 80 pixels wide
+  and uses three-letter labels (`BAS DRM KEY STR BRS GTR VOX FX`), while the
+  strip keeps two-letter codes. Two-letter codes take over below about 64
+  pixels per lane, the three-letter form up to about 110, and full names above
+  that. The waveform is the combined min/max envelope of all channels at each
+  column; the spectrogram uses the combined per-band maximum, so energy that is
+  only on one side still shows.
+  With up to `CH_MAX = 8` input channels the layout stays the same.
+- a software RGB framebuffer is drawn from the single combined view. The
+  terminal path turns each 1x2 pixel pair into a `▀` with truecolor foreground
+  and background; `--png` writes the same framebuffer as a PNG. `src/host.c`
   handles raw mode, terminal size, non-blocking keys and the PNG write.
 - all long-lived state is preallocated. Each channel's samples, magnitudes,
   previous magnitudes, band levels, instrument-bus targets/levels/peaks and hit state
   live in a `reusable` `ChannelState` pool preallocated to the compile-time
   maximum (`CH_MAX = 8`); unused slots are simply not drawn. The history is a
-  `reusable` pool of 96 `Snap` records holding per-channel spectra and instrument-bus
-  levels, allocated once at startup; a full ring frees the oldest slot and
-  reuses it. The footer reports `ch 2/8  ring 96/96  pool 96`, so neither pool
-  grows. Per-frame scratch (the `Snap` value passed to `alloc_index`, FFT and
-  draw locals, format temporaries) is stack-scoped and discarded at the end of
-  the iteration. There is no grow-only array in the frame loop.
+  `reusable` pool of 96 `Snap` records holding the combined spectrum and the
+  eight bus levels, allocated once at startup; a full ring frees the oldest
+  slot and reuses it. The footer reports `ch 2/8  ring 96/96  pool 96`, so
+  neither pool grows. Per-frame scratch (the `Snap` value passed to
+  `alloc_index`, FFT and draw locals, format temporaries) is stack-scoped and
+  discarded at the end of the iteration. There is no grow-only array in the
+  frame loop.
 - smoothing is time-based one-pole attack/release, not per-frame constants, so
   the lanes read the same at 30 and 60 fps; `--fps 60` is supported. The
   spectrogram bands and instrument-bus envelopes use separate taus.
@@ -173,6 +180,11 @@ slices, and printing.
   `src/capture.c` (they are checked against each other at startup);
 - synthetic source: defaults to stereo, pans tonal content left and percussion
   right while keeping bass centred; `--channels 1` restores the mono mix;
+- display combination: the layout takes the maximum per band and per bus
+  across the active channels when it writes a history record, and the lane and
+  strip meters take the same maximum. Analysis stays per channel; only the
+  drawing is combined. Maximum (not mean) keeps an instrument that is panned
+  hard to one side visible;
 - instrument buses are display groupings from spectral features, not true
   source separation. The five tonal buses share the same harmonic peaks and
   differ only in weighting, so they overlap; the `VOCALS` lane does not isolate
@@ -389,37 +401,44 @@ the headroom at 30 and 60 fps, and the channel scaling):
 
 ```text
 # JIT, stereo (goose run)
-bench: frames=240 size=960x540 avg_ms=10.4 min_ms=8.7 max_ms=15.7 ch=2/8 chpool=8 pool=96/96 audio_s=8
-       ch 0 bass=82 drums=5 keys=55 other=44 hits=17
-       ch 1 bass=80 drums=56 keys=51 other=44 hits=32
-       onset_avg=8 onset_max=100
-       implied headroom: 95 frames/s (analysis+render only)
+bench: frames=240 size=960x540 avg_ms=7.0 min_ms=6.4 max_ms=8.8 ch=2/8 chpool=8 pool=96/96 audio_s=8
+       ch 0 bass=82 drums=4 keys=59 strings=48
+            brass=36 guitar=63 vox=34 fx=44 hits=15
+       ch 1 bass=80 drums=51 keys=53 strings=41
+            brass=31 guitar=57 vox=27 fx=43 hits=32
+       onset_avg=9 onset_max=100
+       implied headroom: 142 frames/s (analysis+render only)
 
 # native, stereo (goose build)
-bench: frames=600 size=960x540 avg_ms=2.7 min_ms=2.2 max_ms=4.1 ch=2/8 chpool=8 pool=96/96 audio_s=20
-       ch 0 bass=81 drums=35 keys=33 other=45 hits=45
-       ch 1 bass=81 drums=51 keys=26 other=45 hits=80
+bench: frames=600 size=960x540 avg_ms=1.6 min_ms=1.5 max_ms=2.2 ch=2/8 chpool=8 pool=96/96 audio_s=20
+       ch 0 bass=81 drums=23 keys=35 strings=31
+            brass=15 guitar=31 vox=20 fx=45 hits=40
+       ch 1 bass=81 drums=44 keys=29 strings=21
+            brass=9 guitar=26 vox=10 fx=45 hits=80
        onset_avg=9 onset_max=100
-       implied headroom: 369 frames/s (analysis+render only)
+       implied headroom: 601 frames/s (analysis+render only)
 
 # JIT, 8 channels (compile-time maximum)
-bench: frames=120 size=960x540 avg_ms=15.4 min_ms=12.3 max_ms=21.5 ch=8/8 chpool=8 pool=96/96 audio_s=4
-       ch 0 bass=81 drums=22 keys=58 other=46 hits=9
+bench: frames=120 size=960x540 avg_ms=10.3 min_ms=9.5 max_ms=12.5 ch=8/8 chpool=8 pool=96/96 audio_s=4
+       ch 0 bass=81 drums=19 keys=53 strings=55
+            brass=45 guitar=55 vox=53 fx=45 hits=7
        ...
-       ch 7 bass=79 drums=57 keys=39 other=43 hits=16
+       ch 7 bass=79 drums=47 keys=40 strings=28
+            brass=20 guitar=45 vox=21 fx=43 hits=16
        onset_avg=10 onset_max=100
-       implied headroom: 64 frames/s (analysis+render only)
+       implied headroom: 96 frames/s (analysis+render only)
 ```
 
 Instrument percentages are sampled at the final frame; the synthetic riff changes
 every two seconds, so they move. At 60 fps the stereo JIT run is about
-10 ms/frame (max ~16 ms), still inside the 16.7 ms budget; the native build
-is about 2.7 ms. The 8-channel path is above 60 fps in a native build; use
-`--channels 2` for the normal demo and a wide terminal when testing more.
+7 ms/frame (max ~9 ms), still inside the 16.7 ms budget; the native build
+is about 1.6 ms. The 8-channel JIT path is about 10 ms/frame, so it also stays
+inside the 60 fps budget; use `--channels 2` for the normal demo and a wide
+terminal when testing more.
 
 `pixi run goose visualizer.goose -- --list` prints what miniaudio found. In
 this headless environment it is only the Null fallback; the Null backend
-reports two channels, so `--live` renders two silent panels:
+reports two channels, so `--live` renders a silent two-channel view:
 
 ```text
 capture devices: 1
@@ -486,12 +505,12 @@ goose runtime a5dbd11b6309
 - **Instrument buses are heuristics, not source separation.** BASS/DRUMS/
   KEYS/STRINGS/BRASS/GUITAR/VOCALS/FX are display groupings from low-band
   energy, spectral flux, harmonic peak prominence and spectral shape in the
-  existing FFT. They can show whether a passage is bass-, drum- or tonal-heavy,
-  roughly where the tonal energy sits, and whether it moves in L/R, but the
-  five tonal buses share the same peaks and leak into each other. VOCALS does
-  not isolate a voice, and GUITAR/BRASS/STRINGS cannot identify real
-  instruments. A true separator (for example Demucs) would add a heavy
-  ML/offline dependency; ask before adding one.
+  existing FFT. They can show whether a passage is bass-, drum- or tonal-heavy
+  and roughly where the tonal energy sits, but the five tonal buses share the
+  same peaks and leak into each other. VOCALS does not isolate a voice, and
+  GUITAR/BRASS/STRINGS cannot identify real instruments. A true separator (for
+  example Demucs) would add a heavy ML/offline dependency; ask before adding
+  one.
 - **Audio capture needs a device and an audio backend.** The sidecar uses
   miniaudio, which loads `libasound.so.2`, `libpulse.so.0` or JACK with
   `dlopen` at run time. No development headers or extra pixi packages are
@@ -550,10 +569,10 @@ smaller FFT-only sketch of the same hot loop.
 - `realtime.goose` — fixed-cadence loop: per-tick stack scratch, a bounded
   outbox in a `reusable` pool, and explicit drop-on-full backpressure.
 - `visualizer.goose` — realtime multi-channel instrument-bus visualizer:
-  per-channel Hann window, FFT, eight instrument-bus lanes (bass, drums, keys,
-  strings, brass, guitar, vocals, fx), a stereo instrument summary,
-  side-by-side channel panels, flux onsets, harmonic peaks, ANSI terminal and
-  PNG output.
+  per-channel Hann window and FFT, one full-width eight-lane view (bass,
+  drums, keys, strings, brass, guitar, vocals, fx) combined across channels, a
+  bus summary strip, one waveform and one spectrogram, flux onsets, harmonic
+  peaks, ANSI terminal and PNG output.
 - `visualizer.build` — the sidecar: compiles `src/*.c` and links `m`,
   `pthread` and `dl`.
 - `src/capture.c` — miniaudio capture with native/requested channels,
