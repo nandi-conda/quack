@@ -6,11 +6,13 @@
 //   pixi run viz-bench           headless hot-loop benchmark
 //
 // Capture lives in src/capture.c (a C sidecar): miniaudio opens the default
-// device and its callback writes into a fixed single-producer/single-consumer
-// ring. Everything after that is Goose: a Hann window, an in-place radix-2
-// FFT, four perceptual stem lanes, a waveform, and a stem-tinted spectrogram,
-// all drawn into a software RGB framebuffer that is either converted to ANSI
-// half-blocks for the terminal or written as a PNG.
+// device with its native channel count (or --channels N) and its callback
+// deinterleaves into one fixed SPSC ring per channel. Everything after that is
+// Goose: a Hann window and in-place FFT per channel, four perceptual stem
+// lanes per channel, a waveform and a stem-tinted spectrogram per channel, all
+// drawn into a software RGB framebuffer that is either converted to ANSI
+// half-blocks for the terminal or written as a PNG. Mono is the degenerate
+// one-channel case; stereo and up to CH_MAX channels are side-by-side panels.
 //
 // Stems: SUB is 30-180 Hz; DRUM is high-band spectral flux with a transient
 // envelope and high-frequency ratio; SYNTH is prominent harmonic peaks in the
@@ -23,8 +25,9 @@
 //   * every buffer below is a fixed-size or fixed-capacity array in main or a
 //     data-stack-scoped value passed down by slice;
 //   * the FFT runs in place on re/im, its tables are built once at startup;
-//   * band levels, stem envelopes, peak holds and the framebuffer are
-//     preallocated;
+//   * per-channel samples, magnitude arrays, band levels, stem envelopes and
+//     peak holds live in a `reusable` ChannelState pool preallocated to
+//     CH_MAX slots; the framebuffer is preallocated too;
 //   * the spectrogram history is a `reusable` pool with a hard HIST bound:
 //     its slots are allocated once at startup, and a full ring frees the
 //     oldest before allocating the new one, so its length never grows.
@@ -37,8 +40,11 @@ import os;
 import ffi;
 
 // ---- C sidecar (src/capture.c, src/host.c) --------------------------------
-extern fn cap_open(name: const u8[:], rate: i32, period: i32) -> i32;
-extern fn cap_read(dst: f32[:]) -> i64;
+extern fn cap_open(name: const u8[:], rate: i32, period: i32, channels: i32) -> i32;
+extern fn cap_read(ch: i32, dst: f32[:]) -> i64;
+extern fn cap_channels() -> i32;
+extern fn cap_native_channels() -> i32;
+extern fn cap_max_channels() -> i32;
 extern fn cap_overflow() -> i64;
 extern fn cap_is_null() -> i32;
 extern fn cap_backend() -> u64;
@@ -71,6 +77,9 @@ const FRAME_MAX = 1024 * 1024; // worst-case ANSI frame at the maximum size
 const MAX_COLS = 200;
 const MAX_ROWS = 60;
 const READ_MAX = 4096;        // captures drained per frame
+const CH_MAX = 8;             // must match CAP_MAX_CHANNELS in src/capture.c
+const SNAP_LEVELS = CH_MAX * BANDS;
+const SNAP_STEMS = CH_MAX * STEMS;
 
 const STEM_SUB = 0;
 const STEM_DRUM = 1;
@@ -103,24 +112,60 @@ const FONT_W = 5;
 const FONT_H = 7;
 const FONT_BYTES = 128 * FONT_W;
 
-// One frame in the bounded history pool: the spectrum for the waterfall and
-// the stem levels for the lane sparklines and stem-tinted waterfall.
+// One frame in the bounded history pool: per-channel spectra for the
+// waterfall and per-channel stem levels for the lane sparklines.
 struct Snap {
+    levels: f32[SNAP_LEVELS],
+    stems: f32[SNAP_STEMS],
+}
+
+// Per-channel analysis state, held in a bounded reusable pool: one slot per
+// active channel, preallocated at startup, never grown in the frame loop.
+struct ChannelState {
+    samples: f32[WIN],
+    mag: f32[WIN / 2],
+    prev_mag: f32[WIN / 2],
     levels: f32[BANDS],
-    stems: f32[STEMS],
+    stem_target: f32[STEMS],
+    stem_level: f32[STEMS],
+    stem_peak: f32[STEMS],
+    shead: i64,
+    flux_ready: i64,
+    flux_seen: i64,
+    flux_avg: f32,
+    hit_flash: f32,
+    hit_count: i64,
+    hit_cooldown: i64,
+    last_rms: f32,
+    last_peak: f32,
 }
 
 reusable var history: Snap[>..] = [];
+reusable var channel_state: ChannelState[>..] = [];
+
+fn new_channel() -> ChannelState {
+    return ChannelState {
+        samples: [0.0; WIN],
+        mag: [0.0; WIN / 2],
+        prev_mag: [0.0; WIN / 2],
+        levels: [0.0; BANDS],
+        stem_target: [0.0; STEMS],
+        stem_level: [0.0; STEMS],
+        stem_peak: [0.0; STEMS],
+        shead: 0,
+        flux_ready: 0,
+        flux_seen: 0,
+        flux_avg: 0.0,
+        hit_flash: 0.0,
+        hit_count: 0,
+        hit_cooldown: 0,
+        last_rms: 0.0,
+        last_peak: 0.0,
+    };
+}
 
 // Synthetic source state, used when there is no capture device.
 var synth_rng: u32 = 0x9E3779B9;
-
-// The first frame has no previous magnitudes, so it must not report a huge
-// flux onset. flux_avg adapts to the steady flux floor so note changes and
-// noise do not fire the percussion blinker.
-var flux_ready: bool = false;
-var flux_seen: bool = false;
-var flux_avg: f32 = 0.0;
 
 // ---- small helpers --------------------------------------------------------
 fn bit_reverse(i: i64, bits: i64) -> i64 {
@@ -165,10 +210,16 @@ fn px(fb: u8[:], w: i64, h: i64, x: i64, y: i64, r: u8, g: u8, b: u8) {
     fb[i + 2] = b;
 }
 
-fn hline(fb: u8[:], w: i64, h: i64, y: i64, r: u8, g: u8, b: u8) {
+fn hline(fb: u8[:], w: i64, h: i64, x0: i64, x1: i64, y: i64,
+          r: u8, g: u8, b: u8) {
     if y < 0 || y >= h { return; }
-    var i = y * w * 3;
-    for x in w {
+    var ax = x0;
+    var bx = x1;
+    if ax < 0 { ax = 0; }
+    if bx >= w { bx = w - 1; }
+    if ax > bx { return; }
+    var i = (y * w + ax) * 3;
+    for x in ax..bx + 1 {
         fb[i] = r;
         fb[i + 1] = g;
         fb[i + 2] = b;
@@ -225,6 +276,19 @@ fn stem_label(s: i64, short: bool) -> const u8[:] {
 }
 
 // Lane colours: sub blue, drums amber, synth cyan/green, other violet.
+fn channel_label(ch: i64, nch: i64) -> const u8[:] {
+    if nch <= 1 { return ""; }
+    if nch == 2 { if ch == 0 { return "L"; } return "R"; }
+    if ch == 0 { return "1"; }
+    if ch == 1 { return "2"; }
+    if ch == 2 { return "3"; }
+    if ch == 3 { return "4"; }
+    if ch == 4 { return "5"; }
+    if ch == 5 { return "6"; }
+    if ch == 6 { return "7"; }
+    return "8";
+}
+
 fn stem_color(s: i64) -> u8, u8, u8 {
     if s == STEM_SUB { return 80, 140, 255; }
     if s == STEM_DRUM { return 255, 150, 60; }
@@ -255,6 +319,17 @@ fn setup_font(font: u8[:]) {
     set_glyph(font, 'H', 0x7F, 0x08, 0x08, 0x08, 0x7F);
     set_glyph(font, 'E', 0x7F, 0x49, 0x49, 0x49, 0x41);
     set_glyph(font, 'O', 0x3E, 0x41, 0x41, 0x41, 0x3E);
+    set_glyph(font, 'L', 0x7F, 0x40, 0x40, 0x40, 0x40);
+    set_glyph(font, '0', 0x3E, 0x51, 0x49, 0x45, 0x3E);
+    set_glyph(font, '1', 0x00, 0x42, 0x7F, 0x40, 0x00);
+    set_glyph(font, '2', 0x42, 0x61, 0x51, 0x49, 0x46);
+    set_glyph(font, '3', 0x41, 0x49, 0x49, 0x49, 0x36);
+    set_glyph(font, '4', 0x18, 0x14, 0x12, 0x7F, 0x10);
+    set_glyph(font, '5', 0x4F, 0x49, 0x49, 0x49, 0x31);
+    set_glyph(font, '6', 0x3E, 0x49, 0x49, 0x49, 0x30);
+    set_glyph(font, '7', 0x01, 0x71, 0x09, 0x05, 0x03);
+    set_glyph(font, '8', 0x36, 0x49, 0x49, 0x49, 0x36);
+    set_glyph(font, '9', 0x06, 0x49, 0x49, 0x49, 0x3E);
 }
 
 fn draw_text(fb: u8[:], w: i64, h: i64, x0: i64, y0: i64,
@@ -381,20 +456,19 @@ fn fft(re: f32[:], im: f32[:], cos_t: f32[:], sin_t: f32[:], bitrev: i64[:]) {
     }
 }
 
-// Fills the window, runs the FFT, updates the spectrogram bands and fills the
-// four stem targets. Returns (rms, peak amplitude, onset strength).
-fn analyze(samples: f32[:], shead: i64,
+// Fills one channel's window, runs the FFT, updates its spectrogram bands and
+// fills its four stem targets. Returns (rms, peak amplitude, onset strength).
+fn analyze(st: ChannelState&,
            window: f32[:], re: f32[:], im: f32[:],
            cos_t: f32[:], sin_t: f32[:], bitrev: i64[:],
            band_lo: i64[:], band_hi: i64[:],
-           levels: f32[:], mag: f32[:], prev_mag: f32[:],
-           stem_edges: i64[:], stem_target: f32[:],
+           stem_edges: i64[:],
            band_att: f32, band_rel: f32, flux_avg_coef: f32) -> f32, f32, f32 {
-    let n = samples.len;
+    let n = st.samples.len;
     var rms: f32 = 0.0;
     var peak: f32 = 0.0;
     for i in n {
-        let s = samples[(shead + i) % n];
+        let s = st.samples[(st.shead + i) % n];
         let a = abs(s);
         if a > peak { peak = a; }
         rms += s * s;
@@ -405,56 +479,57 @@ fn analyze(samples: f32[:], shead: i64,
 
     fft(re, im, cos_t, sin_t, bitrev);
 
-    // One magnitude array feeds the bands, the stem energies and the flux.
+    // One magnitude array per channel feeds the bands, stem energies and flux.
     let ref = n as f32 / 4.0;   // full-scale sine after a Hann window
     for k in 1..n / 2 {
-        mag[k] = sqrt(re[k] * re[k] + im[k] * im[k]);
+        st.mag[k] = sqrt(re[k] * re[k] + im[k] * im[k]);
     }
 
     for b in BANDS {
         var mx: f32 = 0.0;
         for k in band_lo[b]..band_hi[b] {
-            if mag[k] > mx { mx = mag[k]; }
+            if st.mag[k] > mx { mx = st.mag[k]; }
         }
         // A gentle tilt lifts the high bands, which fall off in most music.
         let tilt = b as f32 * 0.32;
         let db = 20.0 * log10(mx / ref + 0.000001) + tilt;
         let target = clamp01((db + 70.0) / 70.0);
-        let c = if target > levels[b] { band_att } else { band_rel };
-        levels[b] += (target - levels[b]) * c;
+        let c = if target > st.levels[b] { band_att } else { band_rel };
+        st.levels[b] += (target - st.levels[b]) * c;
     }
 
     // --- stem energies -----------------------------------------------------
     var e_sub: f32 = 0.0;
-    for k in stem_edges[SE_SUB_LO]..stem_edges[SE_SUB_HI] { e_sub += mag[k]; }
+    for k in stem_edges[SE_SUB_LO]..stem_edges[SE_SUB_HI] { e_sub += st.mag[k]; }
     var e_mid: f32 = 0.0;
-    for k in stem_edges[SE_SUB_HI]..stem_edges[SE_MID_HI] { e_mid += mag[k]; }
+    for k in stem_edges[SE_SUB_HI]..stem_edges[SE_MID_HI] { e_mid += st.mag[k]; }
     var e_high: f32 = 0.0;
-    for k in stem_edges[SE_MID_HI]..stem_edges[SE_HIGH_HI] { e_high += mag[k]; }
+    for k in stem_edges[SE_MID_HI]..stem_edges[SE_HIGH_HI] { e_high += st.mag[k]; }
     let e_midhigh = e_mid + e_high;
 
     // Tonal energy: prominent local maxima, not every noise ripple. A
     // 1.6x neighbour ratio is the harmonic/percussive split knob.
     var e_peak: f32 = 0.0;
     for k in stem_edges[SE_SUB_HI] + 1..stem_edges[SE_TONAL_HI] {
-        let m = mag[k];
-        if m > ref * 0.02 && m > mag[k - 1] * 1.6 && m > mag[k + 1] * 1.6 {
+        let m = st.mag[k];
+        if m > ref * 0.02 && m > st.mag[k - 1] * 1.6 && m > st.mag[k + 1] * 1.6 {
             e_peak += m;
         }
     }
 
     // Spectral flux over the high range: positive frame-to-frame changes.
+    let had_flux = st.flux_ready == 1;
     var flux: f32 = 0.0;
-    if flux_ready {
+    if had_flux {
         for k in stem_edges[SE_FLUX_LO]..stem_edges[SE_FLUX_HI] {
-            let d = mag[k] - prev_mag[k];
+            let d = st.mag[k] - st.prev_mag[k];
             if d > 0.0 { flux += d; }
         }
     }
     for k in stem_edges[SE_FLUX_LO]..stem_edges[SE_FLUX_HI] {
-        prev_mag[k] = mag[k];
+        st.prev_mag[k] = st.mag[k];
     }
-    flux_ready = true;
+    st.flux_ready = 1;
 
     let hf_ratio = e_high / (e_midhigh + 0.000001);
 
@@ -462,23 +537,23 @@ fn analyze(samples: f32[:], shead: i64,
     // tonal shimmer or noise bed does not register as a drum hit.
     let flux_norm = flux / ref;
     var onset: f32 = 0.0;
-    if flux_ready {
-        if !flux_seen {
-            flux_avg = flux_norm;
-            flux_seen = true;
+    if had_flux {
+        if st.flux_seen == 0 {
+            st.flux_avg = flux_norm;
+            st.flux_seen = 1;
         } else {
-            let novelty = flux_norm - flux_avg * 1.4;
+            let novelty = flux_norm - st.flux_avg * 1.4;
             onset = clamp01((novelty - 0.03) / 0.45);
-            flux_avg += (flux_norm - flux_avg) * flux_avg_coef;
+            st.flux_avg += (flux_norm - st.flux_avg) * flux_avg_coef;
         }
     }
     var other_e = e_midhigh - e_peak * 0.9 - flux * 0.25;
     if other_e < 0.0 { other_e = 0.0; }
 
-    stem_target[STEM_SUB] = db_level(e_sub, ref * 4.0);
-    stem_target[STEM_DRUM] = clamp01(onset * (0.45 + 0.55 * hf_ratio) + hf_ratio * 0.10);
-    stem_target[STEM_SYNTH] = db_level(e_peak, ref * 2.0);
-    stem_target[STEM_OTHER] = db_level(other_e, ref * 64.0);
+    st.stem_target[STEM_SUB] = db_level(e_sub, ref * 4.0);
+    st.stem_target[STEM_DRUM] = clamp01(onset * (0.45 + 0.55 * hf_ratio) + hf_ratio * 0.10);
+    st.stem_target[STEM_SYNTH] = db_level(e_peak, ref * 2.0);
+    st.stem_target[STEM_OTHER] = db_level(other_e, ref * 64.0);
     return rms, peak, onset;
 }
 
@@ -492,7 +567,10 @@ fn synth_rand() -> f32 {
 
 // A four-bar riff with a kick, a bass, a detuned lead and a slow sweep. It is
 // deterministic, so a screenshot at the same frame is reproducible.
-fn synth_sample(t: f64) -> f32 {
+// Deterministic per-channel source. Mono (nch == 1) keeps the old full mix;
+// stereo pans the tonal part left and percussion right, while bass stays
+// centred. Higher channel counts interpolate between those weights.
+fn synth_sample_ch(t: f64, ch: i64, nch: i64) -> f32 {
     let beat = t % 0.5;
     let kick = exp(-beat * 9.0);
     let bar = ((t / 2.0) as i64) % 4;
@@ -518,14 +596,25 @@ fn synth_sample(t: f64) -> f32 {
     } else { 0.0 };
     let click = if beat < 0.03 { 0.35 * (1.0 - beat / 0.03) } else { 0.0 };
     let noise = synth_rand() as f64 * 0.010;
-    var s = (lead + bass + sweep + shimmer + hat + click + noise) as f32;
+    let tonal = lead + sweep + shimmer + noise;
+
+    var s: f64;
+    if nch <= 1 {
+        s = bass + tonal + hat + click;
+    } else {
+        let x = ch as f64 / (nch - 1);
+        let tw = 0.55 + 0.40 * (1.0 - x);
+        let pw = 0.40 + 0.60 * x;
+        s = bass + tonal * tw + (hat + click) * pw;
+    }
     if s > 1.0 { s = 1.0; }
     else if s < -1.0 { s = -1.0; }
-    return s;
+    return s as f32;
 }
 
 // ---- framebuffer drawing --------------------------------------------------
-fn fill_bg(fb: u8[:], w: i64, h: i64, lanes_h: i64, wave_y1: i64, spec_y0: i64) {
+fn fill_bg(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
+           lanes_h: i64, wave_y1: i64, spec_y0: i64) {
     for y in h {
         var r: i64 = 4;
         var g: i64 = 7;
@@ -547,25 +636,28 @@ fn fill_bg(fb: u8[:], w: i64, h: i64, lanes_h: i64, wave_y1: i64, spec_y0: i64) 
         let rr = r as u8;
         let gg = g as u8;
         let bb = b as u8;
-        var i = y * w * 3;
-        for x in w {
+        var i = (y * w + px0) * 3;
+        for x in pw {
             fb[i] = rr;
             fb[i + 1] = gg;
             fb[i + 2] = bb;
             i += 3;
         }
     }
-    hline(fb, w, h, spec_y0 - 1, 24, 38, 68);
+    hline(fb, w, h, px0, px0 + pw - 1, spec_y0 - 1, 24, 38, 68);
 }
 
 // Four labelled stem lanes. Each lane has a current-level meter, a peak-hold
 // marker, and a sparkline of its own level over the history pool. The drum
 // lane also shows a small hit blinker.
-fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
-                   stem_level: f32[:], stem_peak: f32[:],
-                   slots: i64[:], head: i64, count: i64,
-                   hit_flash: f32, font: u8[:]) {
-    let short = w < 64;
+fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64, lane_h: i64,
+                   st: ChannelState&, ch: i64, label_off: i64,
+                   slots: i64[:], head: i64, count: i64, font: u8[:]) {
+    var fscale = lane_h / 20;
+    if fscale < 1 { fscale = 1; }
+    if fscale > 3 { fscale = 3; }
+    let full_w = 5 * (FONT_W + 1) * fscale - fscale;
+    let short = pw < 4 + label_off + full_w + 12;
     for s in STEMS {
         let y0 = s * lane_h;
         if y0 >= h { return; }
@@ -573,26 +665,25 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
         if y1 >= h { y1 = h - 1; }
         let cr, cg, cb = stem_color(s);
 
-        fill_rect(fb, w, h, 0, y0, w - 1, y1, cr / 9, cg / 9, cb / 9);
-        fill_rect(fb, w, h, 0, y0, 1, y1, cr / 2, cg / 2, cb / 2);
-        if s + 1 < STEMS && y1 + 1 < h { hline(fb, w, h, y1, 26, 32, 44); }
+        fill_rect(fb, w, h, px0, y0, px0 + pw - 1, y1, cr / 9, cg / 9, cb / 9);
+        fill_rect(fb, w, h, px0, y0, px0 + 1, y1, cr / 2, cg / 2, cb / 2);
+        if s + 1 < STEMS && y1 + 1 < h {
+            hline(fb, w, h, px0, px0 + pw - 1, y1, 26, 32, 44);
+        }
 
         let label = stem_label(s, short);
-        var fscale = lane_h / 20;
-        if fscale < 1 { fscale = 1; }
-        if fscale > 3 { fscale = 3; }
         if lane_h >= FONT_H * fscale {
             let ly = y0 + (lane_h - FONT_H * fscale) / 2;
-            draw_text(fb, w, h, 4, ly, label, font, cr, cg, cb, fscale);
+            draw_text(fb, w, h, px0 + 4 + label_off, ly, label, font, cr, cg, cb, fscale);
         }
 
         let label_w = label.len * (FONT_W + 1) * fscale - fscale;
-        var mx0 = 4 + label_w + 4;
-        let meter_w = max(8, w / 8);
+        var mx0 = px0 + 4 + label_off + label_w + 4;
+        let meter_w = max(8, pw / 8);
         var mx1 = mx0 + meter_w - 1;
-        if mx1 > w - 4 { mx1 = w - 4; }
+        if mx1 > px0 + pw - 4 { mx1 = px0 + pw - 4; }
         var sx0 = mx1 + 4;
-        var sx1 = w - 4;
+        var sx1 = px0 + pw - 4;
         if sx0 > sx1 { sx0 = sx1; }
 
         var bar_h = lane_h * 45 / 100;
@@ -605,7 +696,7 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
 
         if mx1 >= mx0 {
             fill_rect(fb, w, h, mx0, my0, mx1, my1, 14, 19, 29);
-            let fill_w = ((mx1 - mx0 + 1) * stem_level[s]) as i64;
+            let fill_w = ((mx1 - mx0 + 1) * st.stem_level[s]) as i64;
             var x = mx0;
             while x < mx0 + fill_w && x <= mx1 {
                 let t = (x - mx0) as f32 / max(1, mx1 - mx0);
@@ -615,7 +706,7 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
                 fill_rect(fb, w, h, x, my0, x, my1, rr, gg, bb);
                 x += 1;
             }
-            let px_x = mx0 + ((mx1 - mx0) * stem_peak[s]) as i64;
+            let px_x = mx0 + ((mx1 - mx0) * st.stem_peak[s]) as i64;
             if px_x >= mx0 && px_x <= mx1 {
                 var py0 = my0 - 1;
                 var py1 = my1 + 1;
@@ -642,7 +733,7 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
                     var v: f32 = 0.0;
                     for k in k0..k1 {
                         let slot = slots[(head + k) % HIST];
-                        let sv = history[slot].stems[s];
+                        let sv = history[slot].stems[ch * STEMS + s];
                         if sv > v { v = sv; }
                     }
                     if v > 0.01 {
@@ -660,31 +751,31 @@ fn draw_stem_lanes(fb: u8[:], w: i64, h: i64, lane_h: i64,
             }
         }
 
-        if s == STEM_DRUM && hit_flash > 0.03 && lane_h >= 5 {
+        if s == STEM_DRUM && st.hit_flash > 0.03 && lane_h >= 5 {
             var bs = lane_h / 8;
             if bs < 5 { bs = 5; }
             if bs > 10 { bs = 10; }
             if bs > lane_h - 2 { bs = lane_h - 2; }
-            let bx = w - bs - 4;
+            let bx = px0 + pw - bs - 4;
             let by = y0 + (lane_h - bs) / 2;
-            let rr = (140.0 + 115.0 * hit_flash) as u8;
-            let gg = (55.0 + 170.0 * hit_flash) as u8;
-            let bb = (15.0 + 210.0 * hit_flash) as u8;
+            let rr = (140.0 + 115.0 * st.hit_flash) as u8;
+            let gg = (55.0 + 170.0 * st.hit_flash) as u8;
+            let bb = (15.0 + 210.0 * st.hit_flash) as u8;
             fill_rect(fb, w, h, bx - 1, by - 1, bx + bs, by + bs, 40, 26, 10);
             fill_rect(fb, w, h, bx, by, bx + bs - 1, by + bs - 1, rr, gg, bb);
         }
     }
 }
 
-fn draw_wave(fb: u8[:], w: i64, h: i64, y0: i64, y1: i64,
-             samples: f32[:], shead: i64, gain: f32) {
+fn draw_wave(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
+             y0: i64, y1: i64, samples: f32[:], shead: i64, gain: f32) {
     let hh = y1 - y0;
-    if hh < 3 { return; }
+    if hh < 3 || pw <= 0 { return; }
     let mid = y0 + hh / 2;
-    hline(fb, w, h, mid, 14, 50, 44);
-    for x in w {
-        let i0 = x * samples.len / w;
-        var i1 = (x + 1) * samples.len / w;
+    hline(fb, w, h, px0, px0 + pw - 1, mid, 14, 50, 44);
+    for x in pw {
+        let i0 = x * samples.len / pw;
+        var i1 = (x + 1) * samples.len / pw;
         if i1 <= i0 { i1 = i0 + 1; }
         var mn: f32 = 0.0;
         var mx: f32 = 0.0;
@@ -702,32 +793,33 @@ fn draw_wave(fb: u8[:], w: i64, h: i64, y0: i64, y1: i64,
         let r, g, bl = heat(0.22 + amp * 0.62);
         var yy = ya;
         while yy <= yb {
-            px(fb, w, h, x, yy, r, g, bl);
+            px(fb, w, h, px0 + x, yy, r, g, bl);
             yy += 1;
         }
     }
 }
 
-fn draw_spectro(fb: u8[:], w: i64, h: i64, y0: i64, spec_h: i64,
-                sub_bands: i64, slots: i64[:], head: i64, count: i64) {
-    if count <= 0 || spec_h <= 0 { return; }
+fn draw_spectro(fb: u8[:], w: i64, h: i64, px0: i64, pw: i64,
+                y0: i64, spec_h: i64, sub_bands: i64, ch: i64,
+                slots: i64[:], head: i64, count: i64) {
+    if count <= 0 || spec_h <= 0 || pw <= 0 { return; }
     let sr, sg, sb = stem_color(STEM_SUB);
     let dr, dg, db = stem_color(STEM_DRUM);
     let yr, yg, yb = stem_color(STEM_SYNTH);
     let or_, og, ob = stem_color(STEM_OTHER);
     for k in count {
         let slot = slots[(head + k) % HIST];
-        let x0 = k * w / count;
-        var x1 = (k + 1) * w / count;
+        let x0 = px0 + k * pw / count;
+        var x1 = px0 + (k + 1) * pw / count;
         if x1 <= x0 { x1 = x0 + 1; }
-        if x1 > w { x1 = w; }
+        if x1 > px0 + pw { x1 = px0 + pw; }
 
         // Mid/high bands take the colour of whichever stem is loudest in this
         // history frame; low bands stay sub-blue. Picking the dominant stem
         // keeps the waterfall readable instead of blending to grey.
-        let wd = history[slot].stems[STEM_DRUM];
-        let ws = history[slot].stems[STEM_SYNTH];
-        let wo = history[slot].stems[STEM_OTHER];
+        let wd = history[slot].stems[ch * STEMS + STEM_DRUM];
+        let ws = history[slot].stems[ch * STEMS + STEM_SYNTH];
+        let wo = history[slot].stems[ch * STEMS + STEM_OTHER];
         var mr: f32 = 35.0;
         var mg: f32 = 42.0;
         var mb: f32 = 58.0;
@@ -741,7 +833,7 @@ fn draw_spectro(fb: u8[:], w: i64, h: i64, y0: i64, spec_h: i64,
 
         for yy in spec_h {
             let b = ((spec_h - 1 - yy) * BANDS) / spec_h;
-            let v = history[slot].levels[b];
+            let v = history[slot].levels[ch * BANDS + b];
             let dim = 0.10 + 0.90 * v;
             var rr = (mr * dim) as u8;
             var gg = (mg * dim) as u8;
@@ -763,10 +855,9 @@ fn draw_spectro(fb: u8[:], w: i64, h: i64, y0: i64, spec_h: i64,
 }
 
 fn draw_scene(fb: u8[:], w: i64, h: i64,
-              stem_level: f32[:], stem_peak: f32[:],
-              samples: f32[:], shead: i64,
+              states: ChannelState[>..]&, nch: i64,
               slots: i64[:], head: i64, count: i64,
-              hit_flash: f32, sub_bands: i64, font: u8[:]) {
+              sub_bands: i64, font: u8[:]) {
     var lane_h = (h * 56 / 100) / STEMS;
     if lane_h < 8 { lane_h = 8; }
     if lane_h * STEMS > h - 8 { lane_h = max(2, (h - 8) / STEMS); }
@@ -777,11 +868,51 @@ fn draw_scene(fb: u8[:], w: i64, h: i64,
     if wave_y1 > h - 2 { wave_y1 = h - 2; }
     if wave_y1 < lanes_h + 1 { wave_y1 = lanes_h + 1; }
 
-    fill_bg(fb, w, h, lanes_h, wave_y1, wave_y1);
-    draw_stem_lanes(fb, w, h, lane_h, stem_level, stem_peak,
-                    slots, head, count, hit_flash, font);
-    draw_wave(fb, w, h, lanes_h, wave_y1, samples, shead, 1.0);
-    draw_spectro(fb, w, h, wave_y1, h - wave_y1, sub_bands, slots, head, count);
+    var fscale = lane_h / 20;
+    if fscale < 1 { fscale = 1; }
+    if fscale > 3 { fscale = 3; }
+
+    for ch in nch {
+        let px0 = ch * w / nch;
+        let px1 = (ch + 1) * w / nch;
+        let pw = px1 - px0;
+        if pw <= 0 { continue; }
+
+        fill_bg(fb, w, h, px0, pw, lanes_h, wave_y1, wave_y1);
+
+        var label_off: i64 = 0;
+        if nch > 1 {
+            label_off = (FONT_W + 1) * fscale + 6;
+        }
+
+        draw_stem_lanes(fb, w, h, px0, pw, lane_h, states[ch], ch, label_off,
+                        slots, head, count, font);
+
+        if nch > 1 {
+            let badge = channel_label(ch, nch);
+            var ly: i64 = 0;
+            if lane_h >= FONT_H * fscale {
+                ly = (lane_h - FONT_H * fscale) / 2;
+            }
+            if lane_h >= FONT_H * fscale + 4 {
+                let bw = FONT_W * fscale;
+                let bh = FONT_H * fscale;
+                fill_rect(fb, w, h, px0 + 2, ly - 2, px0 + 6 + bw, ly + bh + 2,
+                          64, 76, 96);
+                fill_rect(fb, w, h, px0 + 3, ly - 1, px0 + 5 + bw, ly + bh + 1,
+                          16, 20, 30);
+            }
+            draw_text(fb, w, h, px0 + 4, ly, badge, font, 235, 238, 245, fscale);
+        }
+        draw_wave(fb, w, h, px0, pw, lanes_h, wave_y1,
+                  states[ch].samples[..], states[ch].shead, 1.0);
+        draw_spectro(fb, w, h, px0, pw, wave_y1, h - wave_y1,
+                     sub_bands, ch, slots, head, count);
+
+        if ch + 1 < nch {
+            fill_rect(fb, w, h, px1 - 1, 0, px1 - 1, h - 1, 30, 36, 50);
+        }
+    }
 }
 
 // ---- terminal output ------------------------------------------------------
@@ -844,6 +975,8 @@ fn usage() {
     print("  --png PATH        offscreen render, write PATH as a PNG");
     print("  --width N         offscreen width (default 960)");
     print("  --height N        offscreen height (default 540)");
+    print("  --channels N      capture/render N channels (1..8; default native,");
+    print("                    synthetic defaults to 2)");
     print("  --bench           headless benchmark, no window or PNG");
     print("  --help            this text");
     print("");
@@ -872,6 +1005,7 @@ fn main() {
     var opt_fps: i64 = 30;
     var opt_w: i64 = 960;
     var opt_h: i64 = 540;
+    var opt_channels: i64 = 0;
     var png_path: const u8[:] = "";
     var dev_name: const u8[:] = "";
 
@@ -919,6 +1053,12 @@ fn main() {
                 let v, ok = parse_int(av[ai]);
                 if ok { opt_h = clamp_i(v, 90, MAX_H); }
             }
+        } else if a == "--channels" {
+            ai += 1;
+            if ai < av.len {
+                let v, ok = parse_int(av[ai]);
+                if ok { opt_channels = clamp_i(v, 1, CH_MAX); }
+            }
         } else {
             print("unknown option: ", a);
             usage();
@@ -947,15 +1087,8 @@ fn main() {
     build_tables(window[..], cos_t[..], sin_t[..], bitrev[..],
                  band_lo[..], band_hi[..], stem_edges[..]);
 
-    var samples: f32[WIN] = [0.0; WIN];
     var re: f32[WIN] = [0.0; WIN];
     var im: f32[WIN] = [0.0; WIN];
-    var mag: f32[WIN / 2] = [0.0; WIN / 2];
-    var prev_mag: f32[WIN / 2] = [0.0; WIN / 2];
-    var levels: f32[BANDS] = [0.0; BANDS];
-    var stem_target: f32[STEMS] = [0.0; STEMS];
-    var stem_level: f32[STEMS] = [0.0; STEMS];
-    var stem_peak: f32[STEMS] = [0.0; STEMS];
     var scratch: f32[..READ_MAX] = [0.0; READ_MAX];
     var slots: i64[HIST] = [-1; HIST];
     var hist_head: i64 = 0;
@@ -986,16 +1119,20 @@ fn main() {
     let stem_peak_decay = (dt * 0.55) as f32;
     let hit_decay = exp(-dt / 0.110) as f32;
     let flux_avg_coef = coef(dt, 0.70);
-    var hit_flash: f32 = 0.0;
-    var hit_count: i64 = 0;
-    var hit_cooldown: i64 = 0;
     var onset_sum: f32 = 0.0;
     var onset_max: f32 = 0.0;
 
-    // Preallocate the whole history pool once. After this the hot loop only
-    // recycles slots, so the pool length is constant from the first frame.
+    // Preallocate both bounded pools once. Channel states are per channel but
+    // the pool holds the compile-time maximum, so any capture count up to
+    // CH_MAX fits without growth. History holds per-channel spectra/stems.
+    for i in CH_MAX {
+        channel_state.alloc_index(new_channel());
+    }
     for i in HIST {
-        slots[i] = history.alloc_index(Snap { levels: [0.0; BANDS], stems: [0.0; STEMS] });
+        slots[i] = history.alloc_index(Snap {
+            levels: [0.0; SNAP_LEVELS],
+            stems: [0.0; SNAP_STEMS],
+        });
     }
 
     var fb: u8[..FB_MAX] = [0; FB_MAX];
@@ -1009,10 +1146,18 @@ fn main() {
     var using_capture = false;
     var have_device = false;
 
+    if cap_max_channels() != CH_MAX {
+        print("channel maximum mismatch: src/capture.c has ", cap_max_channels(), ", visualizer has ", CH_MAX);
+        return;
+    }
+
+    let synth_channels = if opt_channels > 0 { opt_channels } else { 2 };
+    var live_channels: i64 = 0;
     if !opt_synth {
-        let rc = cap_open(dev_name, SR, 256);
+        let rc = cap_open(dev_name, SR, 256, opt_channels as i32);
         if rc == 0 {
             have_device = true;
+            live_channels = cap_channels();
             if cap_is_null() == 1 {
                 if opt_live {
                     print("capture backend is Null (no audio hardware): capturing silence (--live)");
@@ -1020,10 +1165,17 @@ fn main() {
                     print("capture backend is Null (no audio hardware): using synthetic source");
                     cap_close();
                     have_device = false;
+                    live_channels = 0;
                 }
             } else {
                 using_capture = true;
-                print("capture: ", ffi::cstr(cap_name()), " via ", ffi::cstr(cap_backend()));
+            }
+            if have_device {
+                print("capture: ", ffi::cstr(cap_name()), " via ", ffi::cstr(cap_backend()),
+                      " ", live_channels, " ch");
+                if cap_native_channels() > CH_MAX {
+                    print("device has ", cap_native_channels(), " channels; using the first ", CH_MAX);
+                }
             }
         } else {
             cap_err.append(ffi::cstr(cap_error()));
@@ -1032,6 +1184,10 @@ fn main() {
     }
     if opt_synth { using_capture = false; }
     else if opt_live && have_device { using_capture = true; }
+
+    var nch = if using_capture { live_channels } else { synth_channels };
+    if nch < 1 { nch = 1; }
+    if nch > CH_MAX { nch = CH_MAX; }
 
     let headless = opt_bench || png_path.len > 0;
     if !headless && term_isatty() == 0 {
@@ -1067,18 +1223,22 @@ fn main() {
     }
     var paused = false;
     var synth_t: f64 = 0.0;
-    var shead: i64 = 0;
     var frames_done: i64 = 0;
     var audio_frames: i64 = 0;
     var last_cols = cols;
     var last_rows = rows;
-    // Prime the synthetic window so the first FFT has no zero-padding click.
+    // Prime every synthetic channel so the first FFT has no zero-padding
+    // click. All channels see the same time base.
     if !using_capture {
         for i in WIN * 2 {
-            samples[shead] = synth_sample(synth_t);
-            shead = (shead + 1) % WIN;
-            synth_t += 1.0 / SR;
+            let t = synth_t + i as f64 / SR;
+            for c in nch {
+                channel_state[c].samples[channel_state[c].shead] =
+                    synth_sample_ch(t, c, nch);
+                channel_state[c].shead = (channel_state[c].shead + 1) % WIN;
+            }
         }
+        synth_t += (WIN * 2) as f64 / SR;
     }
 
     var start_ns = clock_ns();
@@ -1094,75 +1254,103 @@ fn main() {
     loop {
         let frame_start = clock_ns();
 
-        // ---- ingest audio (fixed ring; no allocation) --------------------
+        // ---- ingest audio (fixed rings; no allocation) -------------------
         if !paused {
             if using_capture {
-                // Drain in bounded batches. At low fps the ring can hold more
-                // than one scratch buffer; keep only the newest WIN frames.
-                var reads = 0;
-                var got = cap_read(scratch[..]);
-                while got > 0 && reads < 32 {
-                    for k in got {
-                        samples[shead] = scratch[k];
-                        shead = (shead + 1) % WIN;
+                // Drain each channel in bounded batches. At low fps a ring can
+                // hold more than one scratch buffer; keep the newest WIN.
+                for c in nch {
+                    var reads = 0;
+                    var got = cap_read(c as i32, scratch[..]);
+                    while got > 0 && reads < 32 {
+                        for k in got {
+                            channel_state[c].samples[channel_state[c].shead] = scratch[k];
+                            channel_state[c].shead = (channel_state[c].shead + 1) % WIN;
+                        }
+                        if c == 0 { audio_frames += got; }
+                        reads += 1;
+                        got = cap_read(c as i32, scratch[..]);
                     }
-                    audio_frames += got;
-                    reads += 1;
-                    got = cap_read(scratch[..]);
                 }
             } else {
-                // Generate exactly SR/fps samples, in fixed-size chunks.
-                var remaining = SR / opt_fps;
+                // Generate exactly SR/fps samples per channel, with one shared
+                // time base so the stereo image stays coherent.
+                let n = SR / opt_fps;
+                var remaining = n;
+                var offset: i64 = 0;
                 while remaining > 0 {
                     var chunk = remaining;
                     if chunk > READ_MAX { chunk = READ_MAX; }
                     for k in chunk {
-                        samples[shead] = synth_sample(synth_t);
-                        shead = (shead + 1) % WIN;
-                        synth_t += 1.0 / SR;
+                        let t = synth_t + (offset + k) as f64 / SR;
+                        for c in nch {
+                            channel_state[c].samples[channel_state[c].shead] =
+                                synth_sample_ch(t, c, nch);
+                            channel_state[c].shead = (channel_state[c].shead + 1) % WIN;
+                        }
                     }
-                    audio_frames += chunk;
+                    offset += chunk;
                     remaining -= chunk;
                 }
+                synth_t += n as f64 / SR;
+                audio_frames += n;
             }
         }
 
         // ---- analysis ----------------------------------------------------
         if !paused {
-            let rms, peak, onset = analyze(samples[..], shead,
-                                           window[..], re[..], im[..],
-                                           cos_t[..], sin_t[..], bitrev[..],
-                                           band_lo[..], band_hi[..],
-                                           levels[..], mag[..], prev_mag[..],
-                                           stem_edges[..], stem_target[..],
-                                           band_att, band_rel, flux_avg_coef);
-            last_rms = rms;
-            last_peak = peak;
-            onset_sum += onset;
-            if onset > onset_max { onset_max = onset; }
+            var max_rms: f32 = 0.0;
+            var max_peak: f32 = 0.0;
+            for c in nch {
+                let rms, peak, onset = analyze(channel_state[c],
+                                               window[..], re[..], im[..],
+                                               cos_t[..], sin_t[..], bitrev[..],
+                                               band_lo[..], band_hi[..],
+                                               stem_edges[..],
+                                               band_att, band_rel, flux_avg_coef);
+                channel_state[c].last_rms = rms;
+                channel_state[c].last_peak = peak;
+                if rms > max_rms { max_rms = rms; }
+                if peak > max_peak { max_peak = peak; }
+                onset_sum += onset;
+                if onset > onset_max { onset_max = onset; }
 
-            if onset > 0.30 && hit_cooldown == 0 {
-                hit_flash = 1.0;
-                hit_count += 1;
-                hit_cooldown = max(1, opt_fps / 10);   // 100 ms refractory
-            }
-            if hit_cooldown > 0 { hit_cooldown -= 1; }
+                if onset > 0.30 && channel_state[c].hit_cooldown == 0 {
+                    channel_state[c].hit_flash = 1.0;
+                    channel_state[c].hit_count += 1;
+                    channel_state[c].hit_cooldown = max(1, opt_fps / 10);
+                }
+                if channel_state[c].hit_cooldown > 0 {
+                    channel_state[c].hit_cooldown -= 1;
+                }
 
-            // One-pole attack/release per stem. Peak hold falls at a fixed
-            // rate per second, so it reads the same at 30 and 60 fps.
-            for s in STEMS {
-                let t = stem_target[s];
-                let c = if t > stem_level[s] { stem_att[s] } else { stem_rel[s] };
-                stem_level[s] += (t - stem_level[s]) * c;
-                if stem_level[s] > stem_peak[s] {
-                    stem_peak[s] = stem_level[s];
-                } else {
-                    stem_peak[s] -= stem_peak_decay;
-                    if stem_peak[s] < stem_level[s] { stem_peak[s] = stem_level[s]; }
+                // One-pole attack/release per stem, per channel. Peak hold
+                // falls at a fixed rate per second.
+                for st in STEMS {
+                    let t = channel_state[c].stem_target[st];
+                    let k = if t > channel_state[c].stem_level[st] {
+                        stem_att[st]
+                    } else {
+                        stem_rel[st]
+                    };
+                    channel_state[c].stem_level[st] +=
+                        (t - channel_state[c].stem_level[st]) * k;
+                    if channel_state[c].stem_level[st] > channel_state[c].stem_peak[st] {
+                        channel_state[c].stem_peak[st] = channel_state[c].stem_level[st];
+                    } else {
+                        channel_state[c].stem_peak[st] -= stem_peak_decay;
+                        if channel_state[c].stem_peak[st] < channel_state[c].stem_level[st] {
+                            channel_state[c].stem_peak[st] = channel_state[c].stem_level[st];
+                        }
+                    }
+                }
+                channel_state[c].hit_flash *= hit_decay;
+                if channel_state[c].hit_flash < 0.002 {
+                    channel_state[c].hit_flash = 0.0;
                 }
             }
-            hit_flash *= hit_decay;
-            if hit_flash < 0.002 { hit_flash = 0.0; }
+            last_rms = max_rms;
+            last_peak = max_peak;
 
             // Bounded history ring. The pool is already at capacity; a full
             // ring frees the oldest slot and immediately allocates its reuse.
@@ -1171,10 +1359,18 @@ fn main() {
                 history.free(slots[hist_head]);
                 hist_head = (hist_head + 1) % HIST;
                 hist_count -= 1;
-                slot = history.alloc_index(Snap { levels: levels, stems: stem_level });
-            } else {
-                for b in BANDS { history[slot].levels[b] = levels[b]; }
-                for st in STEMS { history[slot].stems[st] = stem_level[st]; }
+                slot = history.alloc_index(Snap {
+                    levels: [0.0; SNAP_LEVELS],
+                    stems: [0.0; SNAP_STEMS],
+                });
+            }
+            for c in nch {
+                for b in BANDS {
+                    history[slot].levels[c * BANDS + b] = channel_state[c].levels[b];
+                }
+                for st in STEMS {
+                    history[slot].stems[c * STEMS + st] = channel_state[c].stem_level[st];
+                }
             }
             slots[(hist_head + hist_count) % HIST] = slot;
             hist_count += 1;
@@ -1194,9 +1390,8 @@ fn main() {
             }
         }
         let fw3 = fw * fh * 3;
-        draw_scene(fb[0..fw3], fw, fh, stem_level[..], stem_peak[..],
-                   samples[..], shead, slots[..], hist_head, hist_count,
-                   hit_flash, sub_bands, font[..]);
+        draw_scene(fb[0..fw3], fw, fh, channel_state, nch,
+                   slots[..], hist_head, hist_count, sub_bands, font[..]);
 
         let work_ns = clock_ns() - frame_start;
         work_ema = work_ema * 0.90 + work_ns * 0.10;
@@ -1212,19 +1407,26 @@ fn main() {
             let pk_db = (20.0 * log10(last_peak + 0.000001)) as i64;
             let wms = (work_ema / 1000000.0) as i64;
             let wds = ((work_ema / 100000.0) as i64) % 10;
+            var hits_total: i64 = 0;
+            for c in nch { hits_total += channel_state[c].hit_count; }
+
             head.resize(0);
             let src = if using_capture { "LIVE" } else { "SYNTH" };
             if last_cols >= 70 {
-                format(head, " GOOSE STEMS  ", src, "  ", opt_fps, "fps  ",
+                format(head, " GOOSE STEMS  ", nch, "ch  ", src, "  ", opt_fps, "fps  ",
                        wms, ".", wds, "ms  rms ", rms_db, "dB  pk ", pk_db, "dB");
             } else {
-                format(head, " GS STEMS ", src, " ", opt_fps, "fps ", rms_db, "dB");
+                format(head, " GS ", nch, "ch ", src, " ", opt_fps, "fps ", rms_db, "dB");
             }
             foot.resize(0);
-            if last_cols >= 76 {
-                format(foot, " q quit  s src  p pause  spc clear  ring ",
-                       hist_count, "/", HIST, "  pool ", history.len,
-                       "  hits ", hit_count, "  drop ", cap_overflow());
+            if last_cols >= 100 {
+                format(foot, " q quit  s src  p pause  spc clear  ch ",
+                       nch, "/", CH_MAX, "  ring ", hist_count, "/", HIST,
+                       "  pool ", history.len, "  hits ", hits_total,
+                       "  drop ", cap_overflow());
+            } else if last_cols >= 76 {
+                format(foot, " q quit  s src  p pause  spc clear  ch ",
+                       nch, "/", CH_MAX, "  hits ", hits_total);
             } else {
                 foot.append(" q quit  s src  p pause");
             }
@@ -1244,11 +1446,21 @@ fn main() {
             let k = term_key();
             if k == 113 || k == 81 || k == 27 || k == 3 { break; }   // q Q Esc Ctrl-C
             else if k == 115 || k == 83 {
-                if have_device { using_capture = !using_capture; }
+                if have_device {
+                    using_capture = !using_capture;
+                    nch = if using_capture { live_channels } else { synth_channels };
+                    if nch < 1 { nch = 1; }
+                    if nch > CH_MAX { nch = CH_MAX; }
+                    hist_head = 0;
+                    hist_count = 0;
+                    synth_t = 0.0;
+                }
             }
             else if k == 112 || k == 80 { paused = !paused; }
             else if k == 32 {
-                for s in STEMS { stem_peak[s] = 0.0; }
+                for c in nch {
+                    for s in STEMS { channel_state[c].stem_peak[s] = 0.0; }
+                }
             }
         }
 
@@ -1283,13 +1495,16 @@ fn main() {
               " avg_ms=", avg / 1000000, ".", (avg % 1000000) / 100000,
               " min_ms=", bench_min / 1000000, ".", (bench_min % 1000000) / 100000,
               " max_ms=", bench_max / 1000000, ".", (bench_max % 1000000) / 100000,
+              " ch=", nch, "/", CH_MAX, " chpool=", channel_state.len,
               " pool=", history.len, "/", HIST, " audio_s=", audio_frames / SR);
-        print("       stems sub=", (stem_level[STEM_SUB] * 100.0) as i64,
-              " drum=", (stem_level[STEM_DRUM] * 100.0) as i64,
-              " synth=", (stem_level[STEM_SYNTH] * 100.0) as i64,
-              " other=", (stem_level[STEM_OTHER] * 100.0) as i64,
-              " hits=", hit_count,
-              " onset_avg=", ((onset_sum / max(1, frames_done)) * 100.0) as i64,
+        for c in nch {
+            print("       ch ", c, " stems sub=", (channel_state[c].stem_level[STEM_SUB] * 100.0) as i64,
+                  " drum=", (channel_state[c].stem_level[STEM_DRUM] * 100.0) as i64,
+                  " synth=", (channel_state[c].stem_level[STEM_SYNTH] * 100.0) as i64,
+                  " other=", (channel_state[c].stem_level[STEM_OTHER] * 100.0) as i64,
+                  " hits=", channel_state[c].hit_count);
+        }
+        print("       onset_avg=", ((onset_sum / max(1, frames_done * nch)) * 100.0) as i64,
               " onset_max=", (onset_max * 100.0) as i64);
         if avg > 0 {
             print("       implied headroom: ", 1000000000 / avg, " frames/s (analysis+render only)");

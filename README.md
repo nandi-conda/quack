@@ -87,20 +87,21 @@ slices, and printing.
 - there is no per-tick allocation and no printing in the hot path, so the
   compute-time band stays tight and there are no GC pauses.
 
-`visualizer.goose` is the realtime stem-aware audio visualizer:
+`visualizer.goose` is the realtime multi-channel, stem-aware audio visualizer:
 
-| Offscreen 960x540 (`pixi run screenshot`) | ANSI terminal, captured through a 120x36 pty |
+| Offscreen 960x540, stereo (`pixi run screenshot`) | ANSI terminal, 160×40 pty |
 | --- | --- |
-| ![Four stem lanes](screenshots/visualizer.png) | ![ANSI terminal](screenshots/terminal.png) |
+| ![Stereo stem panels](screenshots/visualizer.png) | ![ANSI terminal](screenshots/terminal.png) |
 
 - `src/capture.c` opens the default capture device through vendored
-  miniaudio: 48 kHz, mono f32, 256-frame periods. Its callback writes into a
-  fixed 32768-frame single-producer/single-consumer ring. The callback does no
-  allocation, locking or waiting; `cap_read` drains it from the Goose loop.
-- the hot loop keeps a 2048-sample ring, applies a Hann window and runs an
-  in-place radix-2 FFT. Twiddles and the bit-reversal table are built once.
-  64 log-spaced bands remain the basis of the spectrogram; the mix is split
-  into four labelled stem lanes:
+  miniaudio with its **native channel count** (or `--channels N`): 48 kHz
+  interleaved f32, 256-frame periods. The callback deinterleaves into one
+  fixed 32768-frame SPSC ring per channel; the Goose loop drains each with
+  `cap_read(ch, dst)`. The callback does no allocation, locking or waiting.
+  A mono device is the degenerate one-channel case.
+- the hot loop keeps a 2048-sample ring per channel, applies a Hann window and
+  runs an in-place radix-2 FFT. Twiddles and the bit-reversal table are built
+  once. Each channel gets its own 64-band bank and four labelled stem lanes:
   - `SUB` — low energy, 30–180 Hz, blue.
   - `DRUM` — high-band spectral flux (1.5–16 kHz) with an adaptive flux floor,
     a fast transient envelope and a high-frequency ratio; amber, with a compact
@@ -109,41 +110,46 @@ slices, and printing.
     be a local maximum and at least 1.6x its neighbours; cyan/green.
   - `OTHER` — the broadband mid/high residual after subtracting tonal peaks
     and transient flux; violet.
-- each lane has a 5x7 pixel label drawn into the framebuffer, a current-level
+- channels render as side-by-side panels. Mono shows one full-width panel;
+  stereo shows `L`/`R`; up to `CH_MAX = 8` channels get `1`…`8` badges. Each
+  panel has the four labelled stem lanes, a waveform strip, and a stem-tinted
+  96-column spectrogram. Every lane has a 5x7 pixel label, a current-level
   meter, a peak-hold marker, and a sparkline of its own level over the shared
-  96-frame history pool. The `DRUM` lane also draws the transient blinker.
-  The spectrogram is tinted by the dominant stem in each history frame (low
-  bands stay sub-blue), so drum-heavy and synth-heavy passages differ at a
-  glance in both ANSI and PNG.
-- a software RGB framebuffer is drawn from the stem lanes, the waveform and
-  the 96-column spectrogram. The terminal path turns each 1x2 pixel pair into
-  a `▀` with truecolor foreground and background; `--png` writes the same
-  framebuffer as a PNG. `src/host.c` handles raw mode, terminal size,
-  non-blocking keys and the PNG write.
-- all long-lived state is preallocated. Samples, FFT scratch, magnitude and
-  previous-magnitude arrays, stem targets/levels/peaks, the pixel font, the
-  framebuffer, the ANSI frame and the header/footer buffers are fixed-size or
-  fixed-capacity arrays. The history is a `reusable` pool of 96 `Snap` records
-  holding both the 64-band spectrum and the four stem levels, allocated once
-  at startup; when the ring is full the oldest slot is freed and the new one
-  reuses it. The footer reports `ring 96/96  pool 96`, so the pool never grows.
-  Per-frame scratch (the `Snap` value passed to `alloc_index`, FFT and draw
-  locals, format temporaries) is stack-scoped and discarded at the end of the
-  iteration. There is no grow-only array in the frame loop.
+  history pool.
+- a software RGB framebuffer is drawn from the channel panels. The terminal
+  path turns each 1x2 pixel pair into a `▀` with truecolor foreground and
+  background; `--png` writes the same framebuffer as a PNG. `src/host.c`
+  handles raw mode, terminal size, non-blocking keys and the PNG write.
+- all long-lived state is preallocated. Each channel's samples, magnitudes,
+  previous magnitudes, band levels, stem targets/levels/peaks and hit state
+  live in a `reusable` `ChannelState` pool preallocated to the compile-time
+  maximum (`CH_MAX = 8`); unused slots are simply not drawn. The history is a
+  `reusable` pool of 96 `Snap` records holding per-channel spectra and stem
+  levels, allocated once at startup; a full ring frees the oldest slot and
+  reuses it. The footer reports `ch 2/8  ring 96/96  pool 96`, so neither pool
+  grows. Per-frame scratch (the `Snap` value passed to `alloc_index`, FFT and
+  draw locals, format temporaries) is stack-scoped and discarded at the end of
+  the iteration. There is no grow-only array in the frame loop.
 - smoothing is time-based one-pole attack/release, not per-frame constants, so
   the lanes read the same at 30 and 60 fps; `--fps 60` is supported. The
   spectrogram bands and stem envelopes use separate taus.
 - live capture is used when a device exists. If miniaudio falls back to its
   Null backend (no `/dev/snd`, a container, CI) the program says so and
-  switches to a deterministic synthetic riff, so the FFT and renderer still
-  run. `--synthetic` forces the test signal, `--live` forces the silent device.
+  switches to a deterministic synthetic source. Synthetic defaults to stereo
+  (`--channels 2`), `--channels 1` is mono, and `--channels 8` exercises the
+  maximum. `--synthetic` forces the test signal, `--live` forces the silent
+  device.
 - keys: `q` quit, `s` toggle synthetic/live, `p` pause, space clears stem
   peak-holds.
 - quick start: `pixi run viz`; see
   [Run the visualizer](#run-the-visualizer) for native, PNG and flag forms.
 
-**Stem tuning knobs** (all in `visualizer.goose`):
+**Stem and channel tuning knobs** (all in `visualizer.goose`):
 
+- channel maximum: `CH_MAX = 8` in Goose and `CAP_MAX_CHANNELS = 8` in
+  `src/capture.c` (they are checked against each other at startup);
+- synthetic source: defaults to stereo, pans tonal content left and percussion
+  right while keeping bass centred; `--channels 1` restores the mono mix;
 - band edges at the top: `SUB_HZ_LO/HI` 30/180 Hz, `MID_HZ_HI` 2 kHz,
   `HIGH_HZ_HI` 16 kHz, `FLUX_HZ_LO` 1.5 kHz, `TONAL_HZ_HI` 8 kHz;
 - harmonic prominence: a tonal bin must exceed its neighbours by 1.6x;
@@ -164,8 +170,8 @@ compiler-assigned data stacks at exit:
 goose stack stats: main: 3 data stacks, 5 regions (reserving 2 GB each); budget 32 TB for 16376, main program 5, no workers
 # realtime.goose
 goose stack stats: main: 1 data stacks, 4 regions (reserving 2 GB each); budget 32 TB for 16376, main program 4, no workers
-# visualizer.goose (the task passes --stack-reserve 64M)
-goose stack stats: main: 12 data stacks, 15 regions (reserving 64 MB each); budget 32 TB for 516222, main program 15, no workers
+# visualizer.goose (stereo, --stack-reserve 64M)
+goose stack stats: main: 11 data stacks, 16 regions (reserving 64 MB each); budget 32 TB for 516222, main program 16, no workers
 ```
 
 The reservation is address space, not committed memory; it is the upper bound
@@ -181,11 +187,11 @@ The runtime halves a reservation the platform refuses. This is the pattern for
 request-, job-, frame-, or batch-scoped work. Per-unit scratch belongs in
 locals; state that outlives one unit must be bounded up front and pooled.
 
-The visualizer gets 12 data stacks because its large framebuffer and the nested
-draw/format calls each get a stack. At the default 2 GB reserve that is 24 GB of
-*virtual* address space even though the arrays it actually touches are about
-3 MB. `pixi run viz-stack-stats` therefore passes `--stack-reserve 64M`; use
-the same flag in a container with a strict `RLIMIT_AS`.
+The visualizer gets 11 data stacks because its channel pool, framebuffer and
+nested draw/format calls each get a stack. At the default 2 GB reserve that is
+22 GB of *virtual* address space even though the arrays it actually touches
+are a few MB. `pixi run viz-stack-stats` therefore passes `--stack-reserve
+64M`; use the same flag in a container with a strict `RLIMIT_AS`.
 
 The request loop is the "scope is the unit of work" pattern analysed in
 [`docs/heap-less-app-guide.md`](docs/heap-less-app-guide.md) §6.1; the pool ring
@@ -204,7 +210,7 @@ the supported renderers. From the project root:
 
 ```bash
 pixi install          # once
-pixi run viz          # live capture if a device exists, else synthetic
+pixi run viz          # live capture (native channels) if a device exists
 ```
 
 Quit with `q` (or Ctrl-C). The same UI from a native build:
@@ -216,9 +222,10 @@ pixi run run-viz-native
 Headless output instead of the terminal:
 
 ```bash
-pixi run screenshot   # writes screenshots/visualizer.png (960x540)
-pixi run viz-bench    # hot-loop benchmark, no terminal or window
+pixi run screenshot   # stereo 960x540 PNG
+pixi run viz-bench    # stereo hot-loop benchmark, no terminal or window
 pixi run viz-bench-native
+pixi run viz-bench-8ch  # compile-time maximum channel path
 ```
 
 To pass flags, use the direct Goose command; options go after `--`:
@@ -226,7 +233,9 @@ To pass flags, use the direct Goose command; options go after `--`:
 ```bash
 pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --seconds 5
 pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --fps 60 --seconds 5
-pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --png /tmp/vis.png --frames 240
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 1 --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 8 --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 2 --png /tmp/vis.png --frames 240
 pixi run goose --stack-reserve 64M visualizer.goose -- --list
 pixi run goose --stack-reserve 64M visualizer.goose -- --device "USB" --fps 60
 ```
@@ -235,14 +244,19 @@ For a pixi task, a second `--` is needed to reach the program:
 `pixi run viz -- -- --synthetic --seconds 5`.
 
 **Live capture requirements:** `pixi run viz` opens the default capture device
-through miniaudio (ALSA, PulseAudio or JACK, loaded at run time) at 48 kHz mono
-f32. No audio development headers or extra pixi packages are needed. If the
-machine has no capture device (container, CI, no `/dev/snd`), miniaudio falls
-back to its Null backend and the program says so and uses its deterministic
-synthetic signal. `--list` shows devices, `--device NAME` picks one by name
-substring, and `--live` keeps a silent device instead of switching to synthetic.
-Terminal mode needs a TTY with 24-bit color; if stdout is not a TTY the program
-exits with a hint, so use `pixi run screenshot` or `--png`/`--bench` instead.
+through miniaudio (ALSA, PulseAudio or JACK, loaded at run time) at 48 kHz
+interleaved f32 with the device's **native channel count**, clamped to
+`CH_MAX = 8`. The callback deinterleaves into one SPSC ring per channel; a
+mono device runs as the degenerate one-channel case. `--channels N` requests
+N channels (miniaudio converts if needed). No audio development headers or
+extra pixi packages are needed. If the machine has no capture device
+(container, CI, no `/dev/snd`), miniaudio falls back to its Null backend and
+the program says so and uses its deterministic synthetic source, which
+defaults to stereo. `--list` shows devices, `--device NAME` picks one by name
+substring, and `--live` keeps a silent device instead of switching to
+synthetic. Terminal mode needs a TTY with 24-bit color; if stdout is not a TTY
+the program exits with a hint, so use `pixi run screenshot` or
+`--png`/`--bench` instead.
 
 ### All tasks
 
@@ -263,7 +277,8 @@ pixi run realtime-stack-stats   # realtime demo + data-stack high-water mark
 pixi run viz-stack-stats        # visualizer + data-stack high-water mark
 pixi run screenshot             # write screenshots/visualizer.png
 pixi run viz-bench              # headless visualizer benchmark, in-process
-pixi run viz-bench-native       # build, then native visualizer benchmark
+pixi run viz-bench-native       # build, then native stereo benchmark
+pixi run viz-bench-8ch          # 8-channel maximum path benchmark
 pixi run version                # Goose runtime version
 pixi run toolchain              # C compiler, cmake, git, GOOSE_HOME
 ```
@@ -279,7 +294,9 @@ pixi run goose build realtime.goose && ./realtime
 pixi run goose --stack-reserve 64M visualizer.goose                        # live capture, terminal
 pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --seconds 5
 pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --fps 60 --seconds 5
-pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --png /tmp/vis.png --frames 240
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 1 --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 8 --seconds 5
+pixi run goose --stack-reserve 64M visualizer.goose -- --synthetic --channels 2 --png /tmp/vis.png --frames 240
 pixi run goose --stack-reserve 64M visualizer.goose -- --list              # capture devices
 pixi run goose --stack-reserve 64M visualizer.goose -- --bench --frames 240
 pixi run goose build --stack-reserve 64M visualizer.goose && ./visualizer --synthetic
@@ -331,28 +348,43 @@ pool slots=16/16 (high-water, never grows)
 compute ns: min=9590 avg=10165 max=89550 overruns=0
 ```
 
-Expected output of `pixi run viz-bench` and `pixi run viz-bench-native` on
-this host (numbers vary by machine; the point is the headroom at 30 and 60 fps):
+Expected output of `pixi run viz-bench`, `pixi run viz-bench-native` and
+`pixi run viz-bench-8ch` on this host (numbers vary by machine; the point is
+the headroom at 30 and 60 fps, and the channel scaling):
 
 ```text
-# JIT (goose run)
-bench: frames=240 size=960x540 avg_ms=9.0 min_ms=8.2 max_ms=10.5 pool=96/96 audio_s=8
-       stems sub=83 drum=52 synth=56 other=49 hits=33 onset_avg=14 onset_max=100
-       implied headroom: 110 frames/s (analysis+render only)
+# JIT, stereo (goose run)
+bench: frames=240 size=960x540 avg_ms=9.9 min_ms=8.6 max_ms=11.6 ch=2/8 chpool=8 pool=96/96 audio_s=8
+       ch 0 stems sub=82 drum=5 synth=55 other=44 hits=17
+       ch 1 stems sub=80 drum=56 synth=51 other=44 hits=32
+       onset_avg=8 onset_max=100
+       implied headroom: 100 frames/s (analysis+render only)
 
-# native (goose build)
-bench: frames=600 size=960x540 avg_ms=2.1 min_ms=1.9 max_ms=2.9 pool=96/96 audio_s=20
-       stems sub=83 drum=49 synth=34 other=49 hits=80 onset_avg=13 onset_max=100
-       implied headroom: 470 frames/s (analysis+render only)
+# native, stereo (goose build)
+bench: frames=600 size=960x540 avg_ms=2.5 min_ms=2.1 max_ms=3.8 ch=2/8 chpool=8 pool=96/96 audio_s=20
+       ch 0 stems sub=81 drum=35 synth=33 other=45 hits=45
+       ch 1 stems sub=81 drum=51 synth=26 other=45 hits=80
+       onset_avg=9 onset_max=100
+       implied headroom: 389 frames/s (analysis+render only)
+
+# JIT, 8 channels (compile-time maximum)
+bench: frames=120 size=960x540 avg_ms=15.3 min_ms=12.1 max_ms=19.9 ch=8/8 chpool=8 pool=96/96 audio_s=4
+       ch 0 stems sub=81 drum=22 synth=58 other=46 hits=9
+       ...
+       ch 7 stems sub=79 drum=57 synth=39 other=43 hits=16
+       onset_avg=10 onset_max=100
+       implied headroom: 65 frames/s (analysis+render only)
 ```
 
 Stem percentages are sampled at the final frame; the synthetic riff changes
-every two seconds, so they move. On this host `pixi run viz-bench` at 60 fps
-(480 frames) still runs well under the 16.7 ms frame budget, and the time-based
-attack/release keeps the lane envelopes the same shape at 30 and 60 fps.
+every two seconds, so they move. At 60 fps the stereo JIT run is about
+9.5 ms/frame (max 14.3 ms), still inside the 16.7 ms budget; the native build
+is about 2.2 ms. The 8-channel path is above 60 fps in a native build; use
+`--channels 2` for the normal demo and a wide terminal when testing more.
 
 `pixi run goose visualizer.goose -- --list` prints what miniaudio found. In
-this headless environment it is only the Null fallback:
+this headless environment it is only the Null fallback; the Null backend
+reports two channels, so `--live` renders two silent panels:
 
 ```text
 capture devices: 1
@@ -429,11 +461,11 @@ goose runtime a5dbd11b6309
   escape codes into a pipe; use `--png PATH` or `--bench`. Truecolor
   foreground and background are emitted per cell, about 60 KB per 80x24 frame
   (more at larger sizes). Reduce `--fps` or the terminal size over a slow
-  link. `screenshots/terminal.png` was captured through a 120x36 pty;
+  link. `screenshots/terminal.png` was captured through a 160x40 pty;
   `screenshots/visualizer.png` is the same framebuffer written by `--png`, not
   a phone photo of a monitor.
-- **The visualizer reserves 12 data stacks.** At the default 2 GB each that is
-  24 GB of virtual address space (RSS stays small). The `viz-*` and
+- **The visualizer reserves 11 data stacks.** At the default 2 GB each that is
+  22 GB of virtual address space (RSS stays small). The `viz-*` and
   `build-viz` tasks pass `--stack-reserve 64M` for this reason; see
   `viz-stack-stats` and the stack-reserve note above. The PNG save uses
   vendored `stb_image_write`, which allocates while writing the file, never in
@@ -473,13 +505,14 @@ smaller FFT-only sketch of the same hot loop.
   stack plus a bounded ring of recent records in a `reusable` pool.
 - `realtime.goose` — fixed-cadence loop: per-tick stack scratch, a bounded
   outbox in a `reusable` pool, and explicit drop-on-full backpressure.
-- `visualizer.goose` — realtime stem-aware audio visualizer: capture ring,
-  Hann window, FFT, sub/drum/synth/other lanes, flux onsets, harmonic peaks,
-  ANSI terminal and PNG rendering.
+- `visualizer.goose` — realtime multi-channel stem-aware audio visualizer:
+  per-channel Hann window, FFT, sub/drum/synth/other lanes, side-by-side
+  channel panels, flux onsets, harmonic peaks, ANSI terminal and PNG output.
 - `visualizer.build` — the sidecar: compiles `src/*.c` and links `m`,
   `pthread` and `dl`.
-- `src/capture.c` — miniaudio capture into a fixed SPSC ring; device list,
-  backend and error queries.
+- `src/capture.c` — miniaudio capture with native/requested channels,
+  deinterleaved into one fixed SPSC ring per channel; device list, backend,
+  channel-count and error queries.
 - `src/host.c` — raw terminal mode, size and key reads, PNG writer.
 - `vendor/miniaudio.h` — miniaudio 0.11.25 (public domain / MIT-0); audio
   device capture and backend loading.
