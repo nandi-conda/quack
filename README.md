@@ -1,7 +1,7 @@
 # Goose sample project (pixi)
 
 A minimal [pixi](https://pixi.sh) project that installs the **Goose compiler**
-from the `nandi-testing` channel and runs two small programs with it.
+from the `nandi-testing` channel and runs three small programs with it.
 
 Goose is a memory-safe systems language with no heap allocator, garbage
 collector, or lifetime annotations. It compiles to C and can run programs
@@ -22,14 +22,16 @@ not the unrelated "goose" AI agent.
   curl -fsSL https://pixi.sh/install.sh | bash
   ```
 
-- For in-process runs (`pixi run demo`, `pixi run iteration`) the host needs
-  system C library headers: `libc6-dev` on Debian/Ubuntu, `glibc-devel` on
-  Fedora/RHEL. The same applies to `pixi run stack-stats`.
+- For in-process runs (`pixi run demo`, `pixi run iteration`,
+  `pixi run realtime`) the host needs system C library headers: `libc6-dev`
+  on Debian/Ubuntu, `glibc-devel` on Fedora/RHEL. The same applies to the
+  `stack-stats` tasks.
 - For native builds (`pixi run build`, `pixi run run-native`,
-  `pixi run run-iteration-native`) the host needs a C compiler (`gcc` or
-  `clang`) on `PATH`. Run `pixi run toolchain` to see what Goose found.
+  `pixi run run-iteration-native`, `pixi run run-realtime-native`) the host
+  needs a C compiler (`gcc` or `clang`) on `PATH`. Run `pixi run toolchain`
+  to see what Goose found.
 
-Both demos were verified with gcc 15.2.0 on the host.
+All three demos were verified with gcc 15.2.0 on the host.
 
 ## Install
 
@@ -64,11 +66,30 @@ slices, and printing.
   pool. When the ring is full, the oldest slot is freed and immediately reused;
 - the final line reports `pool slots=6`, showing the steady state never grows.
 
-`pixi run stack-stats` adds `-DGS_STACK_STATS=1` and reports the
+`realtime.goose` is the fixed-cadence shape:
+
+- tick `k` has the logical deadline `k * 1 ms`; the timer is simulated, so the
+  demo measures compute time without OS sleep jitter;
+- every tick hashes a fixed 1024-byte stack-local scratch buffer, then offers a
+  flat `Sample` to a 16-entry outbox in a `reusable` pool;
+- a deliberately slower consumer drains one sample every four ticks. When the
+  outbox is full, the new sample is dropped and counted: explicit backpressure,
+  not unbounded buffering and not a blocking producer;
+- freed slots are reused, so `pool slots=16/16` is the high-water mark and the
+  queue never grows. The summary reports min/avg/max compute time and overruns
+  (compute longer than the simulated period);
+- there is no per-tick allocation and no printing in the hot path, so the
+  compute-time band stays tight and there are no GC pauses.
+
+`pixi run stack-stats` and `pixi run realtime-stack-stats` add
+`-DGS_STACK_STATS=1` and report the
 compiler-assigned data stacks at exit:
 
 ```text
+# iteration.goose
 goose stack stats: main: 3 data stacks, 5 regions (reserving 2 GB each); budget 32 TB for 16376, main program 5, no workers
+# realtime.goose
+goose stack stats: main: 1 data stacks, 4 regions (reserving 2 GB each); budget 32 TB for 16376, main program 4, no workers
 ```
 
 The reservation is address space, not committed memory; it is the upper bound
@@ -81,11 +102,14 @@ unit must be bounded up front and pooled.
 ```bash
 pixi run demo                   # basic demo, in-process
 pixi run iteration              # heap-less request/ring demo, in-process
-pixi run check                  # typecheck both programs
-pixi run build                  # build native ./demo and ./iteration
+pixi run realtime               # fixed-cadence loop demo, in-process
+pixi run check                  # typecheck all three programs
+pixi run build                  # build native ./demo, ./iteration, ./realtime
 pixi run run-native             # build, then run ./demo
 pixi run run-iteration-native   # build, then run ./iteration
+pixi run run-realtime-native    # build, then run ./realtime
 pixi run stack-stats            # iteration demo + data-stack high-water mark
+pixi run realtime-stack-stats   # realtime demo + data-stack high-water mark
 pixi run version                # Goose runtime version
 pixi run toolchain              # C compiler, cmake, git, GOOSE_HOME
 ```
@@ -95,7 +119,8 @@ Direct use works too:
 ```bash
 pixi run goose demo.goose
 pixi run goose iteration.goose
-pixi run goose build iteration.goose && ./iteration
+pixi run goose realtime.goose
+pixi run goose build realtime.goose && ./realtime
 ```
 
 Expected output of `pixi run demo`:
@@ -128,8 +153,24 @@ req 23: GET /api/items/2 200 1363 -> hash=2878030888 ring=6/6 pool slots=6
 pool slots=6 (capacity 6, no growth)
 ```
 
+Expected output of `pixi run realtime` (compute times vary by machine and run;
+the band, not the exact numbers, is the point):
+
+```text
+Goose realtime loop: 300 ticks @ 1000000 ns simulated cadence, work=1024 bytes
+tick 0 deadline=0 ns compute=9830 ns queue=0/16
+tick 50 deadline=50000000 ns compute=9720 ns queue=16/16
+tick 100 deadline=100000000 ns compute=9740 ns queue=15/16
+tick 150 deadline=150000000 ns compute=9980 ns queue=16/16
+tick 200 deadline=200000000 ns compute=9780 ns queue=15/16
+tick 250 deadline=250000000 ns compute=9640 ns queue=16/16
+accepted=91 dropped=209 drained=75 queued=16
+pool slots=16/16 (high-water, never grows)
+compute ns: min=9590 avg=10165 max=89550 overruns=0
+```
+
 Goose prints parse/typecheck progress lines on stderr before the program
-output. `pixi run demo` and `pixi run iteration` keep the compiler's exit code.
+output. The `pixi run` demo tasks keep the compiler's exit code.
 
 ## Resolved versions
 
@@ -159,12 +200,47 @@ goose runtime a5dbd11b6309
   build of `goose` in this channel. `pixi.toml` therefore declares only
   `platforms = ["linux-64"]`; adding another platform makes the solve fail.
 - The in-process TinyCC backend borrows the host glibc headers. Without
-  `libc6-dev`/`glibc-devel`, `pixi run demo` and `pixi run iteration` fail
-  while compiling the generated C; `goose check` still works.
+  `libc6-dev`/`glibc-devel`, `pixi run demo`, `pixi run iteration`, and
+  `pixi run realtime` fail while compiling the generated C; `goose check`
+  still works.
 - `goose build` delegates to the host C compiler and needs `gcc`/`clang`.
   It writes the generated C and runtime objects under `GOOSE_HOME`
   (default `~/.goose`), not into this directory.
+- `realtime.goose` uses a **simulated** timer: deadlines are logical tick
+  numbers, not wall-clock sleeps. It measures compute time, so OS scheduling
+  jitter is excluded. It demonstrates the allocation and backpressure shape,
+  not a hard real-time guarantee; that also needs a native build and an OS
+  scheduling policy.
+- `gfx`, `audio`, `ui`, and `physics` are **not built into this conda
+  package** (`pixi run toolchain` reports `built in: no packages`). The first
+  `import gfx;` fetches `github.com/aardappel/goose_gfx@v1` into
+  `~/.goose/pkg`, and `goose check` then works. Building a program that
+  actually calls gfx/audio needs CMake 3.20 or later plus SDL/X11/Wayland
+  development libraries. This environment has no `cmake`, so such a build
+  stops at `cannot find cmake`. Add `cmake` to the environment or use a
+  prebuilt compiler release with the packages built in.
 - Only one version (`2026.3.post100`) is currently published in the channel.
+
+## Reusing the loop for audio
+
+The demos are plain root files. There is no framework to adopt: create
+`audio.goose` beside them and keep the same shape.
+
+- Fix the block size and cadence. For example, 128 frames at 48 kHz is about
+  2.67 ms per block; set `PERIOD_NS` to `2670000` and use the same deadline
+  bookkeeping as `realtime.goose`.
+- Keep input, output, and analysis scratch as locals in the per-block
+  function. They are on data stacks and die when the block returns.
+- Keep history and UI telemetry in a bounded `reusable` pool ring. When it is
+  full, drop and count: never grow, block, or allocate in the block path.
+- Do not print or format from the audio path. Publish flat snapshots to the
+  UI side and drain the ring there.
+- Run it with `pixi run goose audio.goose`, or add pixi tasks for build/run
+  beside the existing ones.
+
+For a graphical visualizer, the device callback itself belongs in native C or
+the gfx audio package; keep the Goose loop as the per-block analysis and
+control layer. See the gfx/audio caveat above before adding `import gfx;`.
 
 ## Files
 
@@ -173,4 +249,6 @@ goose runtime a5dbd11b6309
 - `demo.goose` — language warm-up: structs, recursion, loops, slices, printing.
 - `iteration.goose` — heap-less request loop: per-request scratch on a data
   stack plus a bounded ring of recent records in a `reusable` pool.
+- `realtime.goose` — fixed-cadence loop: per-tick stack scratch, a bounded
+  outbox in a `reusable` pool, and explicit drop-on-full backpressure.
 - `README.md` — this file.

@@ -10,15 +10,19 @@ version = "0.1.0"
 demo = "goose demo.goose"
 # A request/iteration-scoped loop: per-request scratch plus a bounded ring.
 iteration = "goose iteration.goose"
-# Typecheck both programs.
-check = "goose check demo.goose && goose check iteration.goose"
+# A fixed-cadence loop: stack scratch, bounded outbox, explicit backpressure.
+realtime = "goose realtime.goose"
+# Typecheck every program.
+check = "goose check demo.goose && goose check iteration.goose && goose check realtime.goose"
 # Build native executables beside the sources.
-build = "goose build demo.goose && goose build iteration.goose"
-# Build both, then run one of the native executables.
+build = "goose build demo.goose && goose build iteration.goose && goose build realtime.goose"
+# Build all, then run one of the native executables.
 run-native = { cmd = "./demo", depends-on = ["build"] }
 run-iteration-native = { cmd = "./iteration", depends-on = ["build"] }
-# Run the request loop and report its data-stack high-water mark.
+run-realtime-native = { cmd = "./realtime", depends-on = ["build"] }
+# Report each loop's data-stack high-water mark.
 stack-stats = "goose -DGS_STACK_STATS=1 iteration.goose"
+realtime-stack-stats = "goose -DGS_STACK_STATS=1 realtime.goose"
 # Report the runtime version and the C toolchain Goose found.
 version = "goose version"
 toolchain = "goose toolchain"
