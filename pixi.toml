@@ -1,0 +1,22 @@
+[workspace]
+authors = ["orchestrate <threads@orchestrate.invalid>"]
+channels = ["https://prefix.dev/nandi-testing", "conda-forge"]
+name = "goose-sample"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+# Compile and run demo.goose in-process with the bundled TinyCC backend.
+demo = "goose demo.goose"
+# Typecheck only.
+check = "goose check demo.goose"
+# Build a native executable named `demo` beside the source.
+build = "goose build demo.goose"
+# Build, then run the native executable.
+run-native = { cmd = "./demo", depends-on = ["build"] }
+# Report the runtime version and the C toolchain Goose found.
+version = "goose version"
+toolchain = "goose toolchain"
+
+[dependencies]
+goose = ">=2026.3.post100,<2027"
